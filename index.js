@@ -32,8 +32,7 @@ const { PAdESManager } = require('./pades_manager');
       chainPems: chain,
       fieldName: null,
       placeholderHexLen: 120000,
-      addDocumentTimeStamp: true,
-      docTimeStampPlaceholderHexLen: 64000
+      documentTimestamp: { append: false }
     });
     fs.writeFileSync(OUT_PADES_T, pdf);
     console.log('OK', mode, '→', OUT_PADES_T);
@@ -50,9 +49,11 @@ const { PAdESManager } = require('./pades_manager');
       chainPems: chain,
       fieldName: null,
       placeholderHexLen: 120000,
-      addDocumentTimeStamp: true,
-      docTimeStampFieldName: 'DocTS',
-      docTimeStampPlaceholderHexLen: 64000
+      documentTimestamp: {
+        append: true,
+        fieldName: 'DocTS',
+        placeholderHexLen: 64000
+      }
     });
     fs.writeFileSync(OUT_PADES_T_WITH_DOC_TS, pdf);
     console.log('OK', mode, '→', OUT_PADES_T_WITH_DOC_TS);
