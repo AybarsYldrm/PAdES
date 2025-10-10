@@ -99,6 +99,12 @@ class PAdESManager {
    * PAdES-T (CAdES-BES + signatureTimeStampToken).
    * Sertifikada imza yetkisi yoksa otomatik DocTS’e düşer.
    * AcroForm/Sig yoksa görünmez bir /Sig alanı otomatik eklenir.
+   *
+   * DocTS ekleme akışı `documentTimestamp` nesnesiyle yönetilir.
+   *  - { append: true, fieldName, placeholderHexLen } → imzadan sonra DocTS ekler.
+   *  - append=false (varsayılan) → yalnız imza + signatureTimeStampToken üretir.
+   *  - Eski `addDocumentTimeStamp` ve ilgili parametreler geriye dönük uyumluluk için
+   *    desteklenir.
    */
   async signPAdES_T({
     pdfBuffer,
@@ -109,9 +115,14 @@ class PAdESManager {
     placeholderHexLen = 120000,
     addDocumentTimeStamp = false,
     docTimeStampFieldName = null,
-    docTimeStampPlaceholderHexLen = 64000
+    docTimeStampPlaceholderHexLen = 64000,
+    documentTimestamp = null
   }) {
-    this._logDebug('PAdES.sign.start', { fieldName, addDocumentTimeStamp });
+    this._logDebug('PAdES.sign.start', {
+      fieldName,
+      addDocumentTimeStamp,
+      documentTimestampProvided: !!documentTimestamp
+    });
     pdfBuffer = ensureAcroFormAndEmptySigField(pdfBuffer, fieldName || 'Sig1');
 
     // KeyUsage kontrolü (auto fallback DocTS)
@@ -125,13 +136,37 @@ class PAdESManager {
     this._logDebug('PAdES.keyUsage', { keyUsage, eku: ekuList, canSign, reason: canSign ? 'allowed' : 'disallowed' });
 
     const normalizeFieldName = (name) => (typeof name === 'string' && name.length > 0 ? name : null);
+    const resolvedDocTs = (() => {
+      if (documentTimestamp && typeof documentTimestamp === 'object') {
+        const append = !!documentTimestamp.append;
+        const normalizedField = normalizeFieldName(documentTimestamp.fieldName);
+        const placeholder = (typeof documentTimestamp.placeholderHexLen === 'number' && documentTimestamp.placeholderHexLen > 0)
+          ? documentTimestamp.placeholderHexLen
+          : 64000;
+        return { append, fieldName: normalizedField, placeholderHexLen: placeholder };
+      }
+
+      const legacyField = normalizeFieldName(docTimeStampFieldName);
+      const placeholder = (typeof docTimeStampPlaceholderHexLen === 'number' && docTimeStampPlaceholderHexLen > 0)
+        ? docTimeStampPlaceholderHexLen
+        : 64000;
+      return { append: !!addDocumentTimeStamp, fieldName: legacyField, placeholderHexLen: placeholder };
+    })();
+
+    this._logDebug('PAdES.docTimeStamp.config', {
+      append: resolvedDocTs.append,
+      fieldName: resolvedDocTs.fieldName,
+      placeholderHexLen: resolvedDocTs.placeholderHexLen,
+      viaDocumentTimestampOption: !!documentTimestamp
+    });
 
     if (!canSign) {
-      const docTsPlaceholderLen = addDocumentTimeStamp ? docTimeStampPlaceholderHexLen : placeholderHexLen;
-      const fallbackField = normalizeFieldName(addDocumentTimeStamp ? docTimeStampFieldName : fieldName);
+      const docTsPlaceholderLen = resolvedDocTs.append ? resolvedDocTs.placeholderHexLen : placeholderHexLen;
+      const fallbackField = resolvedDocTs.append ? resolvedDocTs.fieldName : normalizeFieldName(fieldName);
       this._logDebug('PAdES.fallback.docTimeStamp', {
         fieldName: fallbackField,
-        placeholderHexLen: docTsPlaceholderLen
+        placeholderHexLen: docTsPlaceholderLen,
+        appendRequested: resolvedDocTs.append
       });
       const fallbackPdf = await this.addDocTimeStamp({
         pdfBuffer,
@@ -188,16 +223,16 @@ class PAdESManager {
     this._logDebug('PAdES.signatureTimestamp.injected', { cmsLength: cmsT.length });
     let signedPdf = writer.toBuffer();
 
-    if (addDocumentTimeStamp) {
-      const docTsField = normalizeFieldName(docTimeStampFieldName);
+    if (resolvedDocTs.append) {
+      const docTsField = resolvedDocTs.fieldName;
       this._logDebug('PAdES.appendDocTimeStamp', {
         fieldName: docTsField,
-        placeholderHexLen: docTimeStampPlaceholderHexLen
+        placeholderHexLen: resolvedDocTs.placeholderHexLen
       });
       signedPdf = await this.addDocTimeStamp({
         pdfBuffer: signedPdf,
         fieldName: docTsField,
-        placeholderHexLen: docTimeStampPlaceholderHexLen
+        placeholderHexLen: resolvedDocTs.placeholderHexLen
       });
       return { pdf: signedPdf, mode: 'pades-t+docts' };
     }
