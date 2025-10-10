@@ -345,6 +345,55 @@ function _ensureDocTimeStampPerms(pdf, rootDict, docTsRef){
   return { rootDict: updatedRoot, rootChanged, extraObjs };
 }
 
+function _ensureDocTimeStampAcroForm(pdf, rootDict, allocateObjNum){
+  let updatedRoot = rootDict;
+  let rootChanged = false;
+  const extraObjs = [];
+
+  const acroInlineMatch = /\/AcroForm\s*<<([\s\S]*?)>>/.exec(updatedRoot);
+  if (acroInlineMatch) {
+    const original = acroInlineMatch[0];
+    let inner = acroInlineMatch[1];
+    let dictStr = '<<' + inner + '>>';
+    const withType = _injectKeyRaw(dictStr, '/Type /AcroForm');
+    const withFields = /\/Fields\s*\[/.test(withType) ? withType : _injectKeyRaw(withType, '/Fields []');
+    const withFlags = _ensureSigFlags(withFields);
+    if (withFlags !== dictStr) {
+      const replacement = withFlags;
+      updatedRoot = updatedRoot.slice(0, acroInlineMatch.index) +
+                    replacement +
+                    updatedRoot.slice(acroInlineMatch.index + original.length);
+      rootChanged = true;
+    }
+    return { rootDict: updatedRoot, rootChanged, extraObjs };
+  }
+
+  const acroRefMatch = /\/AcroForm\s+(\d+)\s+0\s+R/.exec(updatedRoot);
+  if (acroRefMatch) {
+    const acroNum = parseInt(acroRefMatch[1], 10);
+    const acroObj = readObject(pdf, acroNum);
+    const dictStr = acroObj && acroObj.dictStr ? acroObj.dictStr : '<<>>';
+    const withType = _injectKeyRaw(dictStr, '/Type /AcroForm');
+    const withFields = /\/Fields\s*\[/.test(withType) ? withType : _injectKeyRaw(withType, '/Fields []');
+    const withFlags = _ensureSigFlags(withFields);
+    if (withFlags !== dictStr) {
+      extraObjs.push({ objNum: acroNum, contentStr: withFlags });
+    }
+    return { rootDict: updatedRoot, rootChanged, extraObjs };
+  }
+
+  const acroObjNum = allocateObjNum();
+  const acroDict = '<< /Type /AcroForm /Fields [] /SigFlags 3 >>';
+  extraObjs.push({ objNum: acroObjNum, contentStr: acroDict });
+  const injected = _injectKeyRef(updatedRoot, '/AcroForm', acroObjNum + ' 0 R');
+  if (injected !== updatedRoot) {
+    updatedRoot = injected;
+    rootChanged = true;
+  }
+
+  return { rootDict: updatedRoot, rootChanged, extraObjs };
+}
+
 function _appendUniqueRef(dictStr, arrayKey, objNum){
   const ref = objNum + ' 0 R';
   const keyRe = new RegExp(arrayKey.replace('/', '\\/') + '\\s*\\[([\\s\\S]*?)\]');
@@ -697,7 +746,10 @@ class PDFPAdESWriter {
       placeholderHexLen += 1;
     }
 
-    const docTsObjNum = this.size;
+    let nextObjNum = this.size;
+    const allocateObjNum = () => nextObjNum++;
+
+    const docTsObjNum = allocateObjNum();
     let pageRefStr = null;
     try {
       const firstPage = findFirstPageObjNumSafe(this.pdf);
@@ -724,18 +776,20 @@ class PDFPAdESWriter {
     const docTsRef = docTsObjNum + ' 0 R';
     const permsInfo = _ensureDocTimeStampPerms(this.pdf, rootObj.dictStr, docTsRef);
 
+    const acroInfo = _ensureDocTimeStampAcroForm(this.pdf, permsInfo.rootDict, allocateObjNum);
+
     const newObjs = [{ objNum: docTsObjNum, contentStr: sigDict }];
-    if (permsInfo.rootChanged) {
-      newObjs.push({ objNum: this.rootObjNum, contentStr: permsInfo.rootDict });
+    if (permsInfo.rootChanged || acroInfo.rootChanged) {
+      newObjs.push({ objNum: this.rootObjNum, contentStr: acroInfo.rootDict });
     }
     if (Array.isArray(permsInfo.extraObjs) && permsInfo.extraObjs.length) {
       Array.prototype.push.apply(newObjs, permsInfo.extraObjs);
     }
+    if (Array.isArray(acroInfo.extraObjs) && acroInfo.extraObjs.length) {
+      Array.prototype.push.apply(newObjs, acroInfo.extraObjs);
+    }
 
-    const maxObjNum = newObjs.length > 0
-      ? newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity)
-      : (this.size - 1);
-    const newSize = Math.max(this.size, maxObjNum + 1);
+    const newSize = Math.max(this.size, nextObjNum);
 
     const draft = _appendXrefTrailer(this.pdf, newObjs, {
       size: newSize,
