@@ -345,6 +345,100 @@ function _ensureDocTimeStampPerms(pdf, rootDict, docTsRef){
   return { rootDict: updatedRoot, rootChanged, extraObjs };
 }
 
+function _ensureDocTimeStampAcroForm(pdf, rootDict, allocateObjNum, opts){
+  opts = opts || {};
+  const docTsRef = opts.docTsRef;
+  const pageRefStr = opts.pageRefStr || null;
+  const fieldLabel = (typeof opts.fieldName === 'string' && opts.fieldName.length > 0)
+    ? opts.fieldName
+    : 'DocTimeStamp';
+
+  if (!docTsRef) {
+    throw new Error('docTsRef must be provided while preparing DocTimeStamp placeholder.');
+  }
+
+  let updatedRoot = rootDict;
+  let rootChanged = false;
+  const extraObjs = [];
+
+  const fieldObjNum = allocateObjNum();
+  let widgetObjNum = null;
+
+  if (pageRefStr) {
+    const pageMatch = /^(\d+)\s+0\s+R$/.exec(pageRefStr);
+    if (pageMatch) {
+      const pageObjNum = parseInt(pageMatch[1], 10);
+      const pageObj = readObject(pdf, pageObjNum);
+      if (pageObj && pageObj.dictStr && /\/Type\s*\/Page\b/.test(pageObj.dictStr)) {
+        widgetObjNum = allocateObjNum();
+        const widgetDict = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' +
+                           fieldObjNum + ' 0 R /P ' + pageRefStr + ' >>';
+        extraObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+        const updatedPage = _appendUniqueRef(pageObj.dictStr, '/Annots', widgetObjNum);
+        if (updatedPage !== pageObj.dictStr) {
+          extraObjs.push({ objNum: pageObjNum, contentStr: updatedPage });
+        }
+      }
+    }
+  }
+
+  let fieldDict = '<< /FT /Sig /T (' + fieldLabel + ') /Ff 0 /V ' + docTsRef;
+  if (widgetObjNum) {
+    fieldDict += ' /Kids [ ' + widgetObjNum + ' 0 R ]';
+  }
+  fieldDict += ' >>';
+  extraObjs.push({ objNum: fieldObjNum, contentStr: fieldDict });
+
+  const ensureAcroDict = (dictStr) => {
+    let out = dictStr;
+    out = _injectKeyRaw(out, '/Type /AcroForm');
+    out = /\/Fields\s*\[/.test(out) ? out : _injectKeyRaw(out, '/Fields []');
+    out = _appendUniqueRef(out, '/Fields', fieldObjNum);
+    out = _ensureSigFlags(out);
+    return out;
+  };
+
+  const acroInlineMatch = /\/AcroForm\s*<<([\s\S]*?)>>/.exec(updatedRoot);
+  if (acroInlineMatch) {
+    const original = acroInlineMatch[0];
+    const dictStr = '<<' + acroInlineMatch[1] + '>>';
+    const ensured = ensureAcroDict(dictStr);
+    if (ensured !== dictStr) {
+      const replacement = '/AcroForm ' + ensured;
+      updatedRoot = updatedRoot.slice(0, acroInlineMatch.index) +
+                    replacement +
+                    updatedRoot.slice(acroInlineMatch.index + original.length);
+      rootChanged = true;
+    }
+    return { rootDict: updatedRoot, rootChanged, extraObjs };
+  }
+
+  const acroRefMatch = /\/AcroForm\s+(\d+)\s+0\s+R/.exec(updatedRoot);
+  if (acroRefMatch) {
+    const acroNum = parseInt(acroRefMatch[1], 10);
+    const acroObj = readObject(pdf, acroNum);
+    const dictStr = acroObj && acroObj.dictStr ? acroObj.dictStr : '<<>>';
+    const ensured = ensureAcroDict(dictStr);
+    if (ensured !== dictStr) {
+      extraObjs.push({ objNum: acroNum, contentStr: ensured });
+    }
+    return { rootDict: updatedRoot, rootChanged, extraObjs };
+  }
+
+  const acroObjNum = allocateObjNum();
+  let acroDict = '<< /Type /AcroForm /Fields [] /SigFlags 3 >>';
+  acroDict = _appendUniqueRef(acroDict, '/Fields', fieldObjNum);
+  acroDict = _ensureSigFlags(acroDict);
+  extraObjs.push({ objNum: acroObjNum, contentStr: acroDict });
+  const injected = _injectKeyRef(updatedRoot, '/AcroForm', acroObjNum + ' 0 R');
+  if (injected !== updatedRoot) {
+    updatedRoot = injected;
+    rootChanged = true;
+  }
+
+  return { rootDict: updatedRoot, rootChanged, extraObjs };
+}
+
 function _appendUniqueRef(dictStr, arrayKey, objNum){
   const ref = objNum + ' 0 R';
   const keyRe = new RegExp(arrayKey.replace('/', '\\/') + '\\s*\\[([\\s\\S]*?)\]');
@@ -697,7 +791,10 @@ class PDFPAdESWriter {
       placeholderHexLen += 1;
     }
 
-    const docTsObjNum = this.size;
+    let nextObjNum = this.size;
+    const allocateObjNum = () => nextObjNum++;
+
+    const docTsObjNum = allocateObjNum();
     let pageRefStr = null;
     try {
       const firstPage = findFirstPageObjNumSafe(this.pdf);
@@ -724,18 +821,24 @@ class PDFPAdESWriter {
     const docTsRef = docTsObjNum + ' 0 R';
     const permsInfo = _ensureDocTimeStampPerms(this.pdf, rootObj.dictStr, docTsRef);
 
+    const acroInfo = _ensureDocTimeStampAcroForm(this.pdf, permsInfo.rootDict, allocateObjNum, {
+      docTsRef,
+      pageRefStr,
+      fieldName: opts.fieldName
+    });
+
     const newObjs = [{ objNum: docTsObjNum, contentStr: sigDict }];
-    if (permsInfo.rootChanged) {
-      newObjs.push({ objNum: this.rootObjNum, contentStr: permsInfo.rootDict });
+    if (permsInfo.rootChanged || acroInfo.rootChanged) {
+      newObjs.push({ objNum: this.rootObjNum, contentStr: acroInfo.rootDict });
     }
     if (Array.isArray(permsInfo.extraObjs) && permsInfo.extraObjs.length) {
       Array.prototype.push.apply(newObjs, permsInfo.extraObjs);
     }
+    if (Array.isArray(acroInfo.extraObjs) && acroInfo.extraObjs.length) {
+      Array.prototype.push.apply(newObjs, acroInfo.extraObjs);
+    }
 
-    const maxObjNum = newObjs.length > 0
-      ? newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity)
-      : (this.size - 1);
-    const newSize = Math.max(this.size, maxObjNum + 1);
+    const newSize = Math.max(this.size, nextObjNum);
 
     const draft = _appendXrefTrailer(this.pdf, newObjs, {
       size: newSize,
