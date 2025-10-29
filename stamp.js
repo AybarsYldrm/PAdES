@@ -678,7 +678,11 @@ function generateStamp({
   const iend = makeIEND();
   const pngBuf = Buffer.concat([sig, ihdr, idat, iend]);
 
-  fs.writeFileSync(outPath, pngBuf);
+  if (outPath) {
+    fs.writeFileSync(outPath, pngBuf);
+  }
+
+  return pngBuf;
 }
 
 /* ---------- export + example run ---------- */

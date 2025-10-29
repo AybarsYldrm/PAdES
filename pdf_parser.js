@@ -1,19 +1,33 @@
 'use strict';
 const crypto = require('crypto');
+const zlib = require('zlib');
+const { parsePng } = require('./png_decoder');
 
 const PDF_STATE_CACHE = new WeakMap();
 
+function _requirePdfBuffer(value, label) {
+  if (Buffer.isBuffer(value)) return value;
+  if (ArrayBuffer.isView(value)) {
+    const view = value;
+    return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+  }
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+  throw new Error((label || 'pdfBuffer') + ' must be a Buffer or Uint8Array');
+}
+
 function getPdfState(pdf){
-  if (!Buffer.isBuffer(pdf)) throw new Error('pdf must be Buffer');
-  let state = PDF_STATE_CACHE.get(pdf);
+  const buf = _requirePdfBuffer(pdf, 'pdf');
+  let state = PDF_STATE_CACHE.get(buf);
   if (state) return state;
 
-  const pdfStr = pdf.toString('latin1');
+  const pdfStr = buf.toString('latin1');
   const meta = _parseLastTrailer(pdfStr);
   const xrefMap = _buildXrefMap(pdfStr, meta.startxref);
 
   state = { pdfStr, meta, xrefMap };
-  PDF_STATE_CACHE.set(pdf, state);
+  PDF_STATE_CACHE.set(buf, state);
   return state;
 }
 
@@ -128,6 +142,7 @@ function _buildXrefMap(str, startxref){
 /* ------------------------- Basit PDF yardımcıları ------------------------- */
 
 function readLastTrailer(pdf){
+  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { meta } = state;
   return {
@@ -140,6 +155,7 @@ function readLastTrailer(pdf){
 
 /* ---- DENGELİ sözlük okuyan geliştirilmiş readObject (iç içe << >> destekler) ---- */
 function readObject(pdf, objNum){
+  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { pdfStr, xrefMap } = state;
   let offset = xrefMap.get(objNum);
@@ -269,6 +285,69 @@ function _findFirstPageByScan(pdf){
     objRe.lastIndex = endIdx + 6;
   }
   return null;
+}
+
+function _countPagesUnder(pdf, objNum, visited = new Set()){
+  if (visited.has(objNum)) return 0;
+  visited.add(objNum);
+  const obj = readObject(pdf, objNum);
+  if (!obj) return 0;
+  if (_dictHasType(obj.dictStr, 'Page')) return 1;
+  if (!_dictHasType(obj.dictStr, 'Pages')) return 0;
+  const kids = _extractRefArray(obj.dictStr, '/Kids');
+  let total = 0;
+  for (let i = 0; i < kids.length; i++){
+    total += _countPagesUnder(pdf, kids[i], visited);
+  }
+  return total;
+}
+
+function _findPageByIndex(pdf, objNum, targetIndex){
+  const obj = readObject(pdf, objNum);
+  if (!obj) return null;
+  if (_dictHasType(obj.dictStr, 'Page')) {
+    return targetIndex === 0 ? { pageObjNum: objNum } : null;
+  }
+  if (!_dictHasType(obj.dictStr, 'Pages')) return null;
+  const kids = _extractRefArray(obj.dictStr, '/Kids');
+  let remaining = targetIndex;
+  for (let i = 0; i < kids.length; i++){
+    const kid = kids[i];
+    const kidObj = readObject(pdf, kid);
+    if (!kidObj) continue;
+    if (_dictHasType(kidObj.dictStr, 'Page')) {
+      if (remaining === 0) return { pageObjNum: kid };
+      remaining -= 1;
+      continue;
+    }
+    if (_dictHasType(kidObj.dictStr, 'Pages')) {
+      const countMatch = /\/Count\s+(\d+)/.exec(kidObj.dictStr);
+      const childCount = countMatch ? parseInt(countMatch[1], 10) : _countPagesUnder(pdf, kid);
+      if (!Number.isInteger(childCount) || childCount < 0) {
+        continue;
+      }
+      if (remaining < childCount) {
+        return _findPageByIndex(pdf, kid, remaining);
+      }
+      remaining -= childCount;
+    }
+  }
+  return null;
+}
+
+function findPageObjNumByIndex(pdf, pageIndex){
+  if (typeof pageIndex !== 'number' || pageIndex < 0) throw new Error('pageIndex must be >= 0');
+  const meta = readLastTrailer(pdf);
+  const catalog = readObject(pdf, meta.rootObjNum);
+  if (!catalog) throw new Error('Catalog (Root) not found');
+  const pagesRef = /\/Pages\s+(\d+)\s+0\s+R/.exec(catalog.dictStr);
+  if (!pagesRef) throw new Error('Catalog has no /Pages');
+  const pagesNum = parseInt(pagesRef[1], 10);
+  const result = _findPageByIndex(pdf, pagesNum, pageIndex);
+  if (!result || typeof result.pageObjNum !== 'number') {
+    throw new Error('Page index out of range');
+  }
+  return result.pageObjNum;
 }
 
 /* -------------------- AcroForm/Sig & Widget inşa yardımcıları -------------------- */
@@ -457,6 +536,137 @@ function _appendUniqueRef(dictStr, arrayKey, objNum){
   return _injectKeyRaw(dictStr, arrayKey + ' [ ' + ref + ' ]');
 }
 
+function _upsertKeyRaw(dictStr, key, rawValue){
+  const keyEsc = key.replace('/', '\\/');
+  const valuePattern = '(<<[\\s\\S]*?>>|\\[[\\s\\S]*?\]|\((?:[^\\\\)]|\\.)*\)|[^/<>\s][^/\s>]*)';
+  const re = new RegExp('(' + keyEsc + '\\s+)' + valuePattern);
+  if (re.test(dictStr)) {
+    return dictStr.replace(re, function(_match, prefix){
+      return prefix + rawValue;
+    });
+  }
+  return _injectKeyRaw(dictStr, key + ' ' + rawValue);
+}
+
+function _formatPdfNumber(num){
+  if (typeof num !== 'number' || !Number.isFinite(num)) return '0';
+  if (Math.abs(num) >= 1e6 || Math.abs(num) <= 1e-6) {
+    return num.toExponential(6).replace(/0+e/, 'e').replace(/\.e/, 'e');
+  }
+  const fixed = num.toFixed(6);
+  return fixed.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+}
+
+function _setRect(dictStr, rect){
+  if (!Array.isArray(rect) || rect.length !== 4) return dictStr;
+  const rectVals = rect.map((n) => _formatPdfNumber(Number(n) || 0));
+  return _upsertKeyRaw(dictStr, '/Rect', '[ ' + rectVals.join(' ') + ' ]');
+}
+
+function _setKeyRef(dictStr, key, objNum){
+  if (typeof objNum !== 'number' || objNum < 0) return dictStr;
+  return _upsertKeyRaw(dictStr, key, objNum + ' 0 R');
+}
+
+function _extractArrayContent(dictStr, key){
+  const keyEsc = key.replace('/', '\\/');
+  const re = new RegExp(keyEsc + '\\s*\[(.*?)\]', 's');
+  const match = re.exec(dictStr);
+  if (!match) return null;
+  return match[1];
+}
+
+function _extractRefArray(dictStr, key){
+  const content = _extractArrayContent(dictStr, key);
+  if (!content) return [];
+  const refs = [];
+  const re = /(\d+)\s+0\s+R/g;
+  let m;
+  while ((m = re.exec(content)) !== null){
+    refs.push(parseInt(m[1], 10));
+  }
+  return refs;
+}
+
+function _parseRect(dictStr){
+  const match = /\/Rect\s*\[([^\]]+)\]/.exec(dictStr);
+  if (!match) return null;
+  const parts = match[1].trim().split(/\s+/).slice(0, 4);
+  if (parts.length !== 4) return null;
+  return parts.map((p) => parseFloat(p));
+}
+
+function _normalizeRect(rect){
+  if (!Array.isArray(rect) || rect.length !== 4) return rect;
+  const x1 = Number(rect[0]) || 0;
+  const y1 = Number(rect[1]) || 0;
+  const x2 = Number(rect[2]) || 0;
+  const y2 = Number(rect[3]) || 0;
+  const llx = Math.min(x1, x2);
+  const lly = Math.min(y1, y2);
+  const urx = Math.max(x1, x2);
+  const ury = Math.max(y1, y2);
+  return [llx, lly, urx, ury];
+}
+
+function _extractRef(dictStr, key){
+  const keyEsc = key.replace('/', '\\/');
+  const re = new RegExp(keyEsc + '\\s+(\d+)\\s+0\\s+R');
+  const match = re.exec(dictStr);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function _extractDictEntries(dictStr){
+  const entries = [];
+  const re = /\/([A-Za-z0-9\.\-#]+)\s+(<<[\s\S]*?>>|\[[\s\S]*?\]|\((?:[^\\)]|\\.)*\)|\/?[^\s<>]+)/g;
+  let m;
+  while ((m = re.exec(dictStr)) !== null){
+    entries.push({ key: '/' + m[1], value: m[2] });
+  }
+  return entries;
+}
+
+function _composeWidgetDict({ rect, parentObjNum, pageObjNum, extras = [], flags = 132 }){
+  const parts = ['<<', '/Type /Annot', '/Subtype /Widget', '/FT /Sig'];
+  if (Array.isArray(rect) && rect.length === 4) {
+    const normalized = _normalizeRect(rect);
+    const rectVals = normalized.map((n) => _formatPdfNumber(Number(n) || 0));
+    parts.push('/Rect [ ' + rectVals.join(' ') + ' ]');
+  }
+  if (typeof flags === 'number') {
+    parts.push('/F ' + flags);
+  }
+  if (typeof parentObjNum === 'number' && parentObjNum >= 0) {
+    parts.push('/Parent ' + parentObjNum + ' 0 R');
+  }
+  if (typeof pageObjNum === 'number' && pageObjNum >= 0) {
+    parts.push('/P ' + pageObjNum + ' 0 R');
+  }
+  extras.forEach((entry) => {
+    if (entry && entry.key && entry.value) {
+      parts.push(entry.key + ' ' + entry.value);
+    }
+  });
+  parts.push('>>');
+  return parts.join(' ');
+}
+
+function _removeRefFromArray(dictStr, arrayKey, objNum){
+  const content = _extractArrayContent(dictStr, arrayKey);
+  if (!content) return dictStr;
+  const ref = objNum + ' 0 R';
+  const refs = content.match(/\d+\s+0\s+R/g) || [];
+  const filtered = refs.filter((item) => item !== ref);
+  if (filtered.length === refs.length) return dictStr;
+  const keyEsc = arrayKey.replace('/', '\\/');
+  const re = new RegExp(keyEsc + '\\s*\[[^\]]*\]');
+  if (filtered.length === 0) {
+    return dictStr.replace(re, '');
+  }
+  const replacement = arrayKey + ' [ ' + filtered.join(' ') + ' ]';
+  return dictStr.replace(re, replacement);
+}
+
 function _ensureSigFlags(dictStr){
   if (/\/SigFlags\s+3\b/.test(dictStr)) return dictStr;
   if (/\/SigFlags\b/.test(dictStr)){
@@ -497,10 +707,19 @@ function _appendXrefTrailer(baseBuf, newObjs, opts){
   for (var i=0; i<newObjs.length; i++){
     var o = newObjs[i];
     o.offset = pos;
-    const s = o.objNum + ' 0 obj\n' + o.contentStr + '\nendobj\n';
-    const b = Buffer.from(s, 'latin1');
-    chunks.push(b);
-    pos += b.length;
+    const header = Buffer.from(o.objNum + ' 0 obj\n', 'latin1');
+    let body;
+    if (Buffer.isBuffer(o.contentBuffer)) {
+      body = o.contentBuffer;
+    } else if (typeof o.contentStr === 'string') {
+      body = Buffer.from(o.contentStr, 'latin1');
+    } else {
+      body = Buffer.alloc(0);
+    }
+    const footer = Buffer.from('\nendobj\n', 'latin1');
+    const chunk = Buffer.concat([header, body, footer]);
+    chunks.push(chunk);
+    pos += chunk.length;
   }
   const xrefPos = pos;
   const xref = _buildXrefSorted(newObjs);
@@ -515,9 +734,14 @@ function _appendXrefTrailer(baseBuf, newObjs, opts){
  *  - Boş /Sig field + görünmez Widget (/Parent=field, /P=page),
  *  - 1. sayfanın /Annots’una widget referansı eklenir (gerçek /Page objesi!).
  */
-function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
+function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
+  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
+  const opts = options || {};
   const requestedName = (typeof fieldName === 'string' && fieldName.length > 0) ? fieldName : null;
   const fieldLabel = requestedName || 'Sig1';
+  const requestedRect = Array.isArray(opts.rect) && opts.rect.length === 4 ? opts.rect.map((v) => Number(v) || 0) : null;
+  const hasPageIndex = typeof opts.pageIndex === 'number' && opts.pageIndex >= 0;
+  const requestedPageIndex = hasPageIndex ? Math.floor(opts.pageIndex) : null;
 
   const meta = readLastTrailer(pdfBuffer);
   const root = readObject(pdfBuffer, meta.rootObjNum);
@@ -526,7 +750,7 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
   const acroInfo = locateAcroForm(pdfBuffer, meta.rootObjNum);
   const existingField = findEmptySignatureField(pdfBuffer, meta.rootObjNum, requestedName);
 
-  const newObjs = [];
+  const updates = new Map();
   let nextObj = meta.size;
 
   let acroObjNum;
@@ -564,11 +788,40 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
 
   let fieldObjNum;
   let widgetObjNum = null;
+  let widgetDictStr = null;
+  let fieldDictStr = null;
   let pageObjNum = null;
+  let originalWidgetPage = null;
 
   if (existingField) {
     fieldObjNum = existingField.objNum;
-    const updatedAcro = _appendUniqueRef(acroDict, '/Fields', fieldObjNum);
+    fieldDictStr = existingField.dictStr;
+    const kids = _extractRefArray(fieldDictStr, '/Kids');
+    if (kids.length > 0) {
+      widgetObjNum = kids[0];
+      const widgetObj = readObject(pdfBuffer, widgetObjNum);
+      if (widgetObj && widgetObj.dictStr) {
+        widgetDictStr = widgetObj.dictStr;
+        const pageMatch = /\/P\s+(\d+)\s+0\s+R/.exec(widgetDictStr);
+        if (pageMatch) {
+          originalWidgetPage = parseInt(pageMatch[1], 10);
+          if (Number.isInteger(originalWidgetPage)) {
+            pageObjNum = originalWidgetPage;
+          }
+        }
+      }
+    }
+    if (!widgetObjNum) {
+      widgetObjNum = nextObj++;
+      widgetDictStr = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R >>';
+      updates.set(widgetObjNum, { contentStr: widgetDictStr });
+      const updatedFieldDict = _appendUniqueRef(fieldDictStr || '<<>>', '/Kids', widgetObjNum);
+      if (updatedFieldDict !== fieldDictStr) {
+        fieldDictStr = updatedFieldDict;
+        updates.set(fieldObjNum, { contentStr: fieldDictStr });
+      }
+    }
+    const updatedAcro = _appendUniqueRef(acroDict || '<<>>', '/Fields', fieldObjNum);
     if (updatedAcro !== acroDict) {
       acroDict = updatedAcro;
       acroChanged = true;
@@ -576,9 +829,11 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
   } else {
     fieldObjNum = nextObj++;
     widgetObjNum = nextObj++;
+    fieldDictStr = '<< /FT /Sig /T (' + fieldLabel + ') /Ff 0 /Kids [ ' + widgetObjNum + ' 0 R ] >>';
+    updates.set(fieldObjNum, { contentStr: fieldDictStr });
 
     try {
-      pageObjNum = findFirstPageObjNumSafe(pdfBuffer);
+      pageObjNum = hasPageIndex ? findPageObjNumByIndex(pdfBuffer, requestedPageIndex) : findFirstPageObjNumSafe(pdfBuffer);
     } catch (err) {
       pageObjNum = _findFirstPageByScan(pdfBuffer);
       if (!pageObjNum) throw err;
@@ -588,17 +843,13 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
       throw new Error('Resolved page is not /Type /Page');
     }
 
-    const fieldDict = '<< /FT /Sig /T (' + fieldLabel + ') /Ff 0 /Kids [ ' + widgetObjNum + ' 0 R ] >>';
-    const widgetDict = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R /P ' + pageObjNum + ' 0 R >>';
-
-    newObjs.push({ objNum: fieldObjNum, contentStr: fieldDict });
-    newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+    widgetDictStr = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R /P ' + pageObjNum + ' 0 R >>';
+    updates.set(widgetObjNum, { contentStr: widgetDictStr });
 
     let pageDict = pageObj.dictStr;
-    const updatedPage = _appendUniqueRef(pageDict, '/Annots', widgetObjNum);
+    const updatedPage = _appendUniqueRef(pageDict || '<<>>', '/Annots', widgetObjNum);
     if (updatedPage !== pageDict) {
-      pageDict = updatedPage;
-      newObjs.push({ objNum: pageObjNum, contentStr: pageDict });
+      updates.set(pageObjNum, { contentStr: updatedPage });
     }
 
     const updatedAcro = _appendUniqueRef(acroDict || '<<>>', '/Fields', fieldObjNum);
@@ -608,29 +859,133 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
     }
   }
 
-  if (acroChanged) {
-    newObjs.push({ objNum: acroObjNum, contentStr: acroDict });
+  if (!widgetDictStr) {
+    const widgetObj = readObject(pdfBuffer, widgetObjNum);
+    widgetDictStr = widgetObj && widgetObj.dictStr ? widgetObj.dictStr : '<<>>';
+  }
+
+  const resolvePageObj = () => {
+    if (typeof pageObjNum === 'number' && pageObjNum >= 0) return pageObjNum;
+    if (hasPageIndex) {
+      try {
+        pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
+        return pageObjNum;
+      } catch (_err) {
+        // fallthrough
+      }
+    }
+    if (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0) {
+      pageObjNum = originalWidgetPage;
+      return pageObjNum;
+    }
+    try {
+      pageObjNum = findFirstPageObjNumSafe(pdfBuffer);
+      return pageObjNum;
+    } catch (_err) {
+      pageObjNum = _findFirstPageByScan(pdfBuffer);
+      return pageObjNum;
+    }
+  };
+
+  const finalPageObj = resolvePageObj();
+
+  let appliedRect = null;
+  if (requestedRect) {
+    appliedRect = _normalizeRect(requestedRect);
+  } else {
+    const existingRect = _parseRect(widgetDictStr);
+    if (existingRect) appliedRect = _normalizeRect(existingRect);
+  }
+
+  const parentObjNum = (() => {
+    const existingParent = _extractRef(widgetDictStr, '/Parent');
+    if (typeof existingParent === 'number' && existingParent >= 0) return existingParent;
+    return fieldObjNum;
+  })();
+
+  const extras = _extractDictEntries(widgetDictStr || '<<>>').filter((entry) => {
+    const key = entry.key;
+    return !['/Type', '/Subtype', '/FT', '/Rect', '/F', '/Parent', '/P'].includes(key);
+  });
+
+  const targetPageObjNum = (typeof finalPageObj === 'number' && finalPageObj >= 0)
+    ? finalPageObj
+    : (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0 ? originalWidgetPage : null);
+
+  widgetDictStr = _composeWidgetDict({
+    rect: Array.isArray(appliedRect) ? appliedRect : null,
+    parentObjNum,
+    pageObjNum: targetPageObjNum,
+    extras
+  });
+  updates.set(widgetObjNum, { contentStr: widgetDictStr });
+
+  if (typeof targetPageObjNum === 'number' && targetPageObjNum >= 0) {
+    const pageObj = readObject(pdfBuffer, targetPageObjNum);
+    if (pageObj && pageObj.dictStr) {
+      let pageDict = pageObj.dictStr;
+      const pageWithAnnot = _appendUniqueRef(pageDict, '/Annots', widgetObjNum);
+      if (pageWithAnnot !== pageDict) {
+        pageDict = pageWithAnnot;
+        updates.set(targetPageObjNum, { contentStr: pageDict });
+      }
+    }
+    if (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0 && originalWidgetPage !== targetPageObjNum) {
+      const oldPageObj = readObject(pdfBuffer, originalWidgetPage);
+      if (oldPageObj && oldPageObj.dictStr) {
+        const cleaned = _removeRefFromArray(oldPageObj.dictStr, '/Annots', widgetObjNum);
+        if (cleaned !== oldPageObj.dictStr) {
+          updates.set(originalWidgetPage, { contentStr: cleaned });
+        }
+      }
+    }
+  }
+
+  if (acroChanged && typeof acroObjNum === 'number') {
+    updates.set(acroObjNum, { contentStr: acroDict });
   }
   if (rootChanged) {
-    newObjs.push({ objNum: meta.rootObjNum, contentStr: rootDict });
+    updates.set(meta.rootObjNum, { contentStr: rootDict });
   }
 
-  if (newObjs.length === 0) {
-    return pdfBuffer;
+  if (updates.size === 0) {
+    const rectOut = Array.isArray(appliedRect)
+      ? appliedRect
+      : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
+    return {
+      pdf: pdfBuffer,
+      fieldObjNum,
+      widgetObjNum,
+      pageObjNum: typeof targetPageObjNum === 'number' ? targetPageObjNum : (typeof originalWidgetPage === 'number' ? originalWidgetPage : null),
+      rect: rectOut
+    };
   }
 
+  const newObjs = [];
+  updates.forEach((value, key) => {
+    newObjs.push({ objNum: key, ...value });
+  });
   const maxObjNum = newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity);
   const newSize = Math.max(meta.size, maxObjNum + 1);
+  const updatedPdf = _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
+  const rectOut = Array.isArray(appliedRect)
+    ? appliedRect
+    : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
 
-  return _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
+  return {
+    pdf: updatedPdf,
+    fieldObjNum,
+    widgetObjNum,
+    pageObjNum: typeof targetPageObjNum === 'number' ? targetPageObjNum : (typeof originalWidgetPage === 'number' ? originalWidgetPage : null),
+    rect: rectOut
+  };
 }
 
 /* --------------------------- İmza yerleştirici sınıfı --------------------------- */
 
 class PDFPAdESWriter {
   constructor(pdfBuffer){
-    if (!Buffer.isBuffer(pdfBuffer)) throw new Error('pdfBuffer must be Buffer');
-    this.pdf = pdfBuffer;
+    this.pdf = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
     const meta = readLastTrailer(this.pdf);
     this.rootRef = meta.rootRef;
     this.rootObjNum = meta.rootObjNum;
@@ -961,6 +1316,145 @@ class PDFPAdESWriter {
   }
 }
 
+function applyVisibleSignatureAppearance(pdfBuffer, options){
+  if (!options || typeof options !== 'object') throw new Error('options required');
+  const { widgetObjNum, pageObjNum = null, rect, pngBuffer, appearanceName, parentObjNum = null } = options;
+  if (!Buffer.isBuffer(pngBuffer)) throw new Error('pngBuffer must be Buffer');
+  if (typeof widgetObjNum !== 'number') throw new Error('widgetObjNum must be a number');
+  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
+  const rectArr = Array.isArray(rect) && rect.length === 4 ? rect.map((v) => Number(v) || 0) : null;
+  if (!rectArr) throw new Error('rect must be an array of 4 numbers');
+  const normalizedRect = _normalizeRect(rectArr);
+
+  const png = parsePng(pngBuffer);
+  const meta = readLastTrailer(pdfBuffer);
+  let nextObj = meta.size;
+
+  const imageObjNum = nextObj++;
+  let smaskObjNum = null;
+  const newObjs = [];
+
+  const colorCompressed = zlib.deflateSync(png.pixelData);
+  const imageDictParts = [
+    '/Type /XObject',
+    '/Subtype /Image',
+    '/Width ' + png.width,
+    '/Height ' + png.height,
+    '/ColorSpace /' + png.colorSpace,
+    '/BitsPerComponent ' + png.bitDepth,
+    '/Filter /FlateDecode',
+    '/Length ' + colorCompressed.length
+  ];
+  if (png.alphaData) {
+    smaskObjNum = nextObj++;
+    imageDictParts.push('/SMask ' + smaskObjNum + ' 0 R');
+  }
+  const imageHeader = '<< ' + imageDictParts.join(' ') + ' >>\nstream\n';
+  const imageBuffer = Buffer.concat([Buffer.from(imageHeader, 'latin1'), colorCompressed, Buffer.from('\nendstream', 'latin1')]);
+  newObjs.push({ objNum: imageObjNum, contentBuffer: imageBuffer });
+
+  if (png.alphaData) {
+    const alphaCompressed = zlib.deflateSync(png.alphaData);
+    const smaskParts = [
+      '/Type /XObject',
+      '/Subtype /Image',
+      '/Width ' + png.width,
+      '/Height ' + png.height,
+      '/ColorSpace /DeviceGray',
+      '/BitsPerComponent 8',
+      '/Filter /FlateDecode',
+      '/Length ' + alphaCompressed.length
+    ];
+    const smaskHeader = '<< ' + smaskParts.join(' ') + ' >>\nstream\n';
+    const smaskBuffer = Buffer.concat([Buffer.from(smaskHeader, 'latin1'), alphaCompressed, Buffer.from('\nendstream', 'latin1')]);
+    newObjs.push({ objNum: smaskObjNum, contentBuffer: smaskBuffer });
+  }
+
+  const rectWidth = normalizedRect[2] - normalizedRect[0];
+  const rectHeight = normalizedRect[3] - normalizedRect[1];
+  const appearanceWidth = Math.abs(rectWidth);
+  const appearanceHeight = Math.abs(rectHeight);
+  if (appearanceWidth === 0 || appearanceHeight === 0) {
+    throw new Error('visible signature rect must have non-zero width and height');
+  }
+
+  const rawName = typeof appearanceName === 'string' && appearanceName.length > 0 ? appearanceName : 'ImStamp';
+  const sanitized = rawName.replace(/^\//, '').replace(/[^A-Za-z0-9]/g, '') || 'ImStamp';
+  const nameToken = '/' + sanitized;
+
+  const naturalWidth = png.width || 1;
+  const naturalHeight = png.height || 1;
+  const scaleX = appearanceWidth / naturalWidth;
+  const scaleY = appearanceHeight / naturalHeight;
+  const uniformScale = Math.min(scaleX, scaleY);
+  const drawWidth = naturalWidth * uniformScale;
+  const drawHeight = naturalHeight * uniformScale;
+  const offsetX = (appearanceWidth - drawWidth) / 2;
+  const offsetY = (appearanceHeight - drawHeight) / 2;
+
+  const appearanceBodyLines = [
+    'q',
+    _formatPdfNumber(drawWidth) + ' 0 0 ' + _formatPdfNumber(drawHeight) + ' ' +
+      _formatPdfNumber(offsetX) + ' ' + _formatPdfNumber(offsetY) + ' cm',
+    nameToken + ' Do',
+    'Q'
+  ];
+  const appearanceBody = Buffer.from(appearanceBodyLines.join('\n') + '\n', 'latin1');
+  const appearanceDictParts = [
+    '/Type /XObject',
+    '/Subtype /Form',
+    '/FormType 1',
+    '/BBox [0 0 ' + _formatPdfNumber(appearanceWidth) + ' ' + _formatPdfNumber(appearanceHeight) + ']',
+    '/Resources << /XObject << ' + nameToken + ' ' + imageObjNum + ' 0 R >> >>',
+    '/Length ' + appearanceBody.length
+  ];
+  const appearanceHeader = '<< ' + appearanceDictParts.join(' ') + ' >>\nstream\n';
+  const appearanceBuffer = Buffer.concat([Buffer.from(appearanceHeader, 'latin1'), appearanceBody, Buffer.from('\nendstream', 'latin1')]);
+  const appearanceObjNum = nextObj++;
+  newObjs.push({ objNum: appearanceObjNum, contentBuffer: appearanceBuffer });
+
+  const widgetObj = readObject(pdfBuffer, widgetObjNum);
+  if (!widgetObj || !widgetObj.dictStr) throw new Error('Widget object not found');
+  const existingParent = _extractRef(widgetObj.dictStr, '/Parent');
+  const existingPage = _extractRef(widgetObj.dictStr, '/P');
+  const extras = _extractDictEntries(widgetObj.dictStr).filter((entry) => {
+    return !['/Type', '/Subtype', '/FT', '/Rect', '/F', '/Parent', '/P', '/AP', '/AS'].includes(entry.key);
+  });
+  const normalizedWidget = _composeWidgetDict({
+    rect: normalizedRect,
+    parentObjNum: typeof parentObjNum === 'number' && parentObjNum >= 0
+      ? parentObjNum
+      : (typeof existingParent === 'number' ? existingParent : null),
+    pageObjNum: typeof pageObjNum === 'number' && pageObjNum >= 0
+      ? pageObjNum
+      : (typeof existingPage === 'number' ? existingPage : null),
+    extras
+  });
+  let widgetDict = normalizedWidget.replace(/>>\s*$/, '');
+  if (!/\/Parent\s+\d+\s+0\s+R/.test(widgetDict) && typeof existingParent === 'number' && existingParent >= 0) {
+    widgetDict += ' /Parent ' + existingParent + ' 0 R';
+  }
+  if (typeof pageObjNum === 'number' && pageObjNum >= 0 && !/\/P\s+\d+\s+0\s+R/.test(widgetDict)) {
+    widgetDict += ' /P ' + pageObjNum + ' 0 R';
+  }
+  widgetDict += ' /AP << /N ' + appearanceObjNum + ' 0 R >>';
+  widgetDict += ' /AS /N';
+  widgetDict += ' >>';
+  newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+
+  const maxObjNum = newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity);
+  const newSize = Math.max(meta.size, maxObjNum + 1);
+  const updatedPdf = _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
+
+  return {
+    pdf: updatedPdf,
+    appearanceObjNum,
+    imageObjNum,
+    smaskObjNum,
+    widgetObjNum
+  };
+}
+
 /* ------------------------------ AcroForm lookup ------------------------------ */
 
 function locateAcroForm(pdf, rootObjNum){
@@ -1006,6 +1500,7 @@ function findEmptySignatureField(pdf, rootObjNum, fieldName){
 module.exports = {
   PDFPAdESWriter,
   ensureAcroFormAndEmptySigField,
+  applyVisibleSignatureAppearance,
   readLastTrailer,
   readObject
 };
