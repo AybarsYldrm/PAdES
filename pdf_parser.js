@@ -582,6 +582,19 @@ function _parseRect(dictStr){
   return parts.map((p) => parseFloat(p));
 }
 
+function _normalizeRect(rect){
+  if (!Array.isArray(rect) || rect.length !== 4) return rect;
+  const x1 = Number(rect[0]) || 0;
+  const y1 = Number(rect[1]) || 0;
+  const x2 = Number(rect[2]) || 0;
+  const y2 = Number(rect[3]) || 0;
+  const llx = Math.min(x1, x2);
+  const lly = Math.min(y1, y2);
+  const urx = Math.max(x1, x2);
+  const ury = Math.max(y1, y2);
+  return [llx, lly, urx, ury];
+}
+
 function _extractRef(dictStr, key){
   const keyEsc = key.replace('/', '\\/');
   const re = new RegExp(keyEsc + '\\s+(\d+)\\s+0\\s+R');
@@ -602,7 +615,8 @@ function _extractDictEntries(dictStr){
 function _composeWidgetDict({ rect, parentObjNum, pageObjNum, extras = [], flags = 132 }){
   const parts = ['<<', '/Type /Annot', '/Subtype /Widget', '/FT /Sig'];
   if (Array.isArray(rect) && rect.length === 4) {
-    const rectVals = rect.map((n) => _formatPdfNumber(Number(n) || 0));
+    const normalized = _normalizeRect(rect);
+    const rectVals = normalized.map((n) => _formatPdfNumber(Number(n) || 0));
     parts.push('/Rect [ ' + rectVals.join(' ') + ' ]');
   }
   if (typeof flags === 'number') {
@@ -862,10 +876,10 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
 
   let appliedRect = null;
   if (requestedRect) {
-    appliedRect = requestedRect;
+    appliedRect = _normalizeRect(requestedRect);
   } else {
     const existingRect = _parseRect(widgetDictStr);
-    if (existingRect) appliedRect = existingRect;
+    if (existingRect) appliedRect = _normalizeRect(existingRect);
   }
 
   const parentObjNum = (() => {
@@ -920,7 +934,9 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
   }
 
   if (updates.size === 0) {
-    const rectOut = Array.isArray(appliedRect) ? appliedRect : (_parseRect(widgetDictStr) || [0, 0, 0, 0]);
+    const rectOut = Array.isArray(appliedRect)
+      ? appliedRect
+      : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
     return {
       pdf: pdfBuffer,
       fieldObjNum,
@@ -937,7 +953,9 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
   const maxObjNum = newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity);
   const newSize = Math.max(meta.size, maxObjNum + 1);
   const updatedPdf = _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
-  const rectOut = Array.isArray(appliedRect) ? appliedRect : (_parseRect(widgetDictStr) || [0, 0, 0, 0]);
+  const rectOut = Array.isArray(appliedRect)
+    ? appliedRect
+    : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
 
   return {
     pdf: updatedPdf,
@@ -1291,6 +1309,7 @@ function applyVisibleSignatureAppearance(pdfBuffer, options){
   if (typeof widgetObjNum !== 'number') throw new Error('widgetObjNum must be a number');
   const rectArr = Array.isArray(rect) && rect.length === 4 ? rect.map((v) => Number(v) || 0) : null;
   if (!rectArr) throw new Error('rect must be an array of 4 numbers');
+  const normalizedRect = _normalizeRect(rectArr);
 
   const png = parsePng(pngBuffer);
   const meta = readLastTrailer(pdfBuffer);
@@ -1336,8 +1355,8 @@ function applyVisibleSignatureAppearance(pdfBuffer, options){
     newObjs.push({ objNum: smaskObjNum, contentBuffer: smaskBuffer });
   }
 
-  const rectWidth = rectArr[2] - rectArr[0];
-  const rectHeight = rectArr[3] - rectArr[1];
+  const rectWidth = normalizedRect[2] - normalizedRect[0];
+  const rectHeight = normalizedRect[3] - normalizedRect[1];
   const appearanceWidth = Math.abs(rectWidth);
   const appearanceHeight = Math.abs(rectHeight);
   if (appearanceWidth === 0 || appearanceHeight === 0) {
@@ -1348,9 +1367,20 @@ function applyVisibleSignatureAppearance(pdfBuffer, options){
   const sanitized = rawName.replace(/^\//, '').replace(/[^A-Za-z0-9]/g, '') || 'ImStamp';
   const nameToken = '/' + sanitized;
 
+  const naturalWidth = png.width || 1;
+  const naturalHeight = png.height || 1;
+  const scaleX = appearanceWidth / naturalWidth;
+  const scaleY = appearanceHeight / naturalHeight;
+  const uniformScale = Math.min(scaleX, scaleY);
+  const drawWidth = naturalWidth * uniformScale;
+  const drawHeight = naturalHeight * uniformScale;
+  const offsetX = (appearanceWidth - drawWidth) / 2;
+  const offsetY = (appearanceHeight - drawHeight) / 2;
+
   const appearanceBodyLines = [
     'q',
-    _formatPdfNumber(appearanceWidth) + ' 0 0 ' + _formatPdfNumber(appearanceHeight) + ' 0 0 cm',
+    _formatPdfNumber(drawWidth) + ' 0 0 ' + _formatPdfNumber(drawHeight) + ' ' +
+      _formatPdfNumber(offsetX) + ' ' + _formatPdfNumber(offsetY) + ' cm',
     nameToken + ' Do',
     'Q'
   ];
@@ -1376,7 +1406,7 @@ function applyVisibleSignatureAppearance(pdfBuffer, options){
     return !['/Type', '/Subtype', '/FT', '/Rect', '/F', '/Parent', '/P', '/AP', '/AS'].includes(entry.key);
   });
   const normalizedWidget = _composeWidgetDict({
-    rect: rectArr,
+    rect: normalizedRect,
     parentObjNum: typeof parentObjNum === 'number' && parentObjNum >= 0
       ? parentObjNum
       : (typeof existingParent === 'number' ? existingParent : null),
