@@ -28,8 +28,17 @@ const { PAdESManager } = require('./pades_manager');
       keyPem,
       certPem,
       chainPems: chain,
-      fieldName: null,
+      fieldName: 'VisibleSig',
       placeholderHexLen: 60000,
+      visibleSignature: {
+        fieldName: 'VisibleSig',
+        pageIndex: 0,
+        rect: [50, 50, 350, 200],
+        stamp: {
+          fontPath: path.join(baseDir, 'font.ttf'),
+          pngLogoPath: path.join(baseDir, 'caduceus.png')
+        }
+      },
       documentTimestamp: { append: false },
     });
     fs.writeFileSync(OUT_PADES_T, pdf);

@@ -45,6 +45,70 @@ function parseCertBasics(certDer){
   return { issuerFullDER, serialContent, spkiAlgOid, ecCurveOid, recommendedHash };
 }
 
+function _decodeASN1String(valueBuf, tag){
+  switch (tag) {
+    case 0x0C: // UTF8String
+      return valueBuf.toString('utf8');
+    case 0x13: // PrintableString
+    case 0x14: // T61String (treat as latin1)
+    case 0x16: // IA5String
+      return valueBuf.toString('latin1');
+    case 0x1E: { // BMPString (UTF-16BE)
+      let out = '';
+      for (let i = 0; i + 1 < valueBuf.length; i += 2) {
+        out += String.fromCharCode((valueBuf[i] << 8) | valueBuf[i + 1]);
+      }
+      return out;
+    }
+    default:
+      return valueBuf.toString('utf8');
+  }
+}
+
+function extractSubjectCommonName(certDer){
+  let top = readTLV(certDer, 0);
+  if (top.tag !== 0x30) throw new Error('bad cert outer');
+  let p = top.start;
+  const tbs = readTLV(certDer, p);
+  if (tbs.tag !== 0x30) throw new Error('bad tbs');
+  p = tbs.start;
+
+  let v = readTLV(certDer, p);
+  if (v.tag === 0xA0) p = v.next; // version
+  p = readTLV(certDer, p).next; // serial
+  p = readTLV(certDer, p).next; // signature algorithm
+  p = readTLV(certDer, p).next; // issuer
+  p = readTLV(certDer, p).next; // validity
+
+  const subject = readTLV(certDer, p);
+  if (subject.tag !== 0x30) throw new Error('no subject');
+
+  let sp = subject.start;
+  while (sp < subject.end) {
+    const rdnSet = readTLV(certDer, sp);
+    sp = rdnSet.next;
+    if (rdnSet.tag !== 0x31) continue;
+
+    let attrPos = rdnSet.start;
+    while (attrPos < rdnSet.end) {
+      const attr = readTLV(certDer, attrPos);
+      attrPos = attr.next;
+      if (attr.tag !== 0x30) continue;
+
+      const oidT = readTLV(certDer, attr.start);
+      if (oidT.tag !== 0x06) continue;
+      const oid = oidFromBytes(certDer.slice(oidT.start, oidT.end));
+
+      const valueT = readTLV(certDer, oidT.next);
+      if (oid === '2.5.4.3') { // commonName
+        const valueBuf = certDer.slice(valueT.start, valueT.end);
+        return _decodeASN1String(valueBuf, valueT.tag).trim();
+      }
+    }
+  }
+  return null;
+}
+
 /** Minimal KeyUsage & EKU parse (digitalSignature / contentCommitment / keyAgreement) */
 function parseKeyUsageAndEKU(certDer){
   function tlv(buf,pos){ const t=buf[pos]; let l=buf[pos+1], n=1; if(l&0x80){const k=l&0x7F; l=0; for(let i=0;i<k;i++) l=(l<<8)|buf[pos+2+i]; n=1+k;} const s=pos+1+n, e=s+l; return {t,l,h:1+n,s,e,nxt:e}; }
@@ -89,4 +153,4 @@ function parseKeyUsageAndEKU(certDer){
   return out;
 }
 
-module.exports = { pemToDer, parseCertBasics, parseKeyUsageAndEKU, readTLV, oidFromBytes };
+module.exports = { pemToDer, parseCertBasics, parseKeyUsageAndEKU, readTLV, oidFromBytes, extractSubjectCommonName };
