@@ -125,6 +125,7 @@ function extractSubjectAttributes(certDer){
   p = readTLV(certDer, p).next; // serial
   p = readTLV(certDer, p).next; // sigalg
   p = readTLV(certDer, p).next; // issuer
+  p = readTLV(certDer, p).next; // validity
   const subjectTLV = readTLV(certDer, p); if (subjectTLV.tag !== 0x30) throw new Error('no subject');
 
   const subjectBuf = certDer.slice(subjectTLV.start - subjectTLV.hdr, subjectTLV.end);
