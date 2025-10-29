@@ -1,22 +1,33 @@
 'use strict';
 const crypto = require('crypto');
 const zlib = require('zlib');
-
 const { parsePng } = require('./png_decoder');
 
 const PDF_STATE_CACHE = new WeakMap();
 
+function _requirePdfBuffer(value, label) {
+  if (Buffer.isBuffer(value)) return value;
+  if (ArrayBuffer.isView(value)) {
+    const view = value;
+    return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+  }
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+  throw new Error((label || 'pdfBuffer') + ' must be a Buffer or Uint8Array');
+}
+
 function getPdfState(pdf){
-  if (!Buffer.isBuffer(pdf)) throw new Error('pdf must be Buffer');
-  let state = PDF_STATE_CACHE.get(pdf);
+  const buf = _requirePdfBuffer(pdf, 'pdf');
+  let state = PDF_STATE_CACHE.get(buf);
   if (state) return state;
 
-  const pdfStr = pdf.toString('latin1');
+  const pdfStr = buf.toString('latin1');
   const meta = _parseLastTrailer(pdfStr);
   const xrefMap = _buildXrefMap(pdfStr, meta.startxref);
 
   state = { pdfStr, meta, xrefMap };
-  PDF_STATE_CACHE.set(pdf, state);
+  PDF_STATE_CACHE.set(buf, state);
   return state;
 }
 
@@ -131,6 +142,7 @@ function _buildXrefMap(str, startxref){
 /* ------------------------- Basit PDF yardımcıları ------------------------- */
 
 function readLastTrailer(pdf){
+  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { meta } = state;
   return {
@@ -143,6 +155,7 @@ function readLastTrailer(pdf){
 
 /* ---- DENGELİ sözlük okuyan geliştirilmiş readObject (iç içe << >> destekler) ---- */
 function readObject(pdf, objNum){
+  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { pdfStr, xrefMap } = state;
   let offset = xrefMap.get(objNum);
@@ -272,36 +285,6 @@ function _findFirstPageByScan(pdf){
     objRe.lastIndex = endIdx + 6;
   }
   return null;
-}
-
-function _collectPagesInOrder(pdf, objNum, out, depth){
-  if (depth > 40) return;
-  const obj = readObject(pdf, objNum);
-  if (!obj || !obj.dictStr) return;
-  if (_dictHasType(obj.dictStr, 'Page')) {
-    out.push(objNum);
-    return;
-  }
-  if (_dictHasType(obj.dictStr, 'Pages')) {
-    const kids = _readKidsArray(obj.dictStr);
-    for (let i = 0; i < kids.length; i++){
-      _collectPagesInOrder(pdf, kids[i], out, depth + 1);
-    }
-  }
-}
-
-function findPageObjNumByIndex(pdf, index){
-  if (!Number.isInteger(index) || index < 0) throw new Error('pageIndex must be a non-negative integer');
-  const meta = readLastTrailer(pdf);
-  const catalog = readObject(pdf, meta.rootObjNum);
-  if (!catalog) throw new Error('Catalog (Root) not found');
-  const pagesRef = /\/Pages\s+(\d+)\s+0\s+R/.exec(catalog.dictStr);
-  if (!pagesRef) throw new Error('Catalog has no /Pages');
-  const pagesNum = parseInt(pagesRef[1], 10);
-  const pages = [];
-  _collectPagesInOrder(pdf, pagesNum, pages, 0);
-  if (index >= pages.length) return null;
-  return pages[index];
 }
 
 function _countPagesUnder(pdf, objNum, visited = new Set()){
@@ -767,6 +750,7 @@ function _appendXrefTrailer(baseBuf, newObjs, opts){
  *  - 1. sayfanın /Annots’una widget referansı eklenir (gerçek /Page objesi!).
  */
 function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
+  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
   const opts = options || {};
   const requestedName = (typeof fieldName === 'string' && fieldName.length > 0) ? fieldName : null;
   const fieldLabel = requestedName || 'Sig1';
@@ -1016,8 +1000,7 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
 
 class PDFPAdESWriter {
   constructor(pdfBuffer){
-    if (!Buffer.isBuffer(pdfBuffer)) throw new Error('pdfBuffer must be Buffer');
-    this.pdf = pdfBuffer;
+    this.pdf = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
     const meta = readLastTrailer(this.pdf);
     this.rootRef = meta.rootRef;
     this.rootObjNum = meta.rootObjNum;
@@ -1353,6 +1336,7 @@ function applyVisibleSignatureAppearance(pdfBuffer, options){
   const { widgetObjNum, pageObjNum = null, rect, pngBuffer, appearanceName, parentObjNum = null } = options;
   if (!Buffer.isBuffer(pngBuffer)) throw new Error('pngBuffer must be Buffer');
   if (typeof widgetObjNum !== 'number') throw new Error('widgetObjNum must be a number');
+  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
   const rectArr = Array.isArray(rect) && rect.length === 4 ? rect.map((v) => Number(v) || 0) : null;
   if (!rectArr) throw new Error('rect must be an array of 4 numbers');
   const normalizedRect = _normalizeRect(rectArr);
@@ -1662,7 +1646,7 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
 module.exports = {
   PDFPAdESWriter,
   ensureAcroFormAndEmptySigField,
+  applyVisibleSignatureAppearance,
   readLastTrailer,
-  readObject,
-  applyVisibleSignatureStamp
+  readObject
 };

@@ -1,7 +1,6 @@
 'use strict';
 const crypto = require('crypto');
-const path = require('path');
-const { PDFPAdESWriter, ensureAcroFormAndEmptySigField, applyVisibleSignatureStamp } = require('./pdf_parser');
+const { PDFPAdESWriter, ensureAcroFormAndEmptySigField, applyVisibleSignatureAppearance } = require('./pdf_parser');
 const { pemToDer, parseCertBasics, parseKeyUsageAndEKU, extractSubjectCommonName } = require('./x509_extract');
 const { buildTSQ, requestTimestamp, extractTimeStampTokenOrThrow } = require('./rfc3161');
 const { OIDS } = require('./oids');
@@ -121,34 +120,85 @@ class PAdESManager {
     chainPems = [],
     fieldName = null,
     placeholderHexLen = 120000,
-    visibleSignature = null,
     addDocumentTimeStamp = false,
     docTimeStampFieldName = null,
     docTimeStampPlaceholderHexLen = 64000,
-    documentTimestamp = null
+    documentTimestamp = null,
+    visibleSignature = null
   }) {
-    const normalizeFieldName = (name) => (typeof name === 'string' && name.length > 0 ? name : null);
-    const normalizedFieldName = normalizeFieldName(fieldName);
-    const visibleFieldName = (() => {
-      if (visibleSignature && typeof visibleSignature === 'object') {
-        const vs = normalizeFieldName(visibleSignature.fieldName);
-        if (vs) return vs;
-      }
-      return normalizedFieldName;
-    })();
-    const ensureField = visibleFieldName || 'Sig1';
-
     this._logDebug('PAdES.sign.start', {
-      fieldName: normalizedFieldName,
-      ensureField,
+      fieldName,
       addDocumentTimeStamp,
-      documentTimestampProvided: !!documentTimestamp,
-      visibleSignature: !!visibleSignature
+      documentTimestampProvided: !!documentTimestamp
     });
-    pdfBuffer = ensureAcroFormAndEmptySigField(pdfBuffer, ensureField);
+
+    const leafDer = pemToDer(certPem);
+    const subjectCommonName = extractSubjectCommonName(leafDer);
+
+    const visibleSigConfig = (visibleSignature && typeof visibleSignature === 'object') ? visibleSignature : null;
+    const ensureOptions = {};
+    let resolvedRect = null;
+
+    if (visibleSigConfig) {
+      const rectSource = typeof visibleSigConfig.rect === 'function'
+        ? visibleSigConfig.rect(subjectCommonName)
+        : visibleSigConfig.rect;
+      if (Array.isArray(rectSource) && rectSource.length === 4) {
+        resolvedRect = rectSource.map((v) => Number(v) || 0);
+        ensureOptions.rect = resolvedRect;
+      }
+      const pageIndexSource = typeof visibleSigConfig.pageIndex === 'function'
+        ? visibleSigConfig.pageIndex(subjectCommonName)
+        : visibleSigConfig.pageIndex;
+      if (typeof pageIndexSource === 'number' && pageIndexSource >= 0) {
+        ensureOptions.pageIndex = Math.floor(pageIndexSource);
+      }
+    }
+
+    const ensuredField = ensureAcroFormAndEmptySigField(pdfBuffer, fieldName || 'Sig1', ensureOptions);
+    pdfBuffer = ensuredField.pdf;
+
+    if (visibleSigConfig && resolvedRect) {
+      const stampOptions = visibleSigConfig.stamp || {};
+      if (!stampOptions.fontPath || !stampOptions.pngLogoPath) {
+        throw new Error('visibleSignature.stamp.fontPath and pngLogoPath are required');
+      }
+      const resolvedName = (() => {
+        if (typeof visibleSigConfig.personName === 'function') return visibleSigConfig.personName(subjectCommonName);
+        if (typeof visibleSigConfig.personName === 'string') return visibleSigConfig.personName;
+        if (typeof stampOptions.personName === 'function') return stampOptions.personName(subjectCommonName);
+        if (typeof stampOptions.personName === 'string') return stampOptions.personName;
+        return subjectCommonName || '';
+      })();
+      const stampParams = {
+        fontPath: stampOptions.fontPath,
+        pngLogoPath: stampOptions.pngLogoPath,
+        personName: resolvedName,
+        outPath: stampOptions.outPath,
+        finalW: stampOptions.finalW,
+        finalH: stampOptions.finalH,
+        leftW: stampOptions.leftW,
+        rightW: stampOptions.rightW,
+        SS: stampOptions.SS
+      };
+      const stampBuffer = generateStamp(stampParams);
+      const appearanceResult = applyVisibleSignatureAppearance(pdfBuffer, {
+        widgetObjNum: ensuredField.widgetObjNum,
+        pageObjNum: ensuredField.pageObjNum,
+        parentObjNum: ensuredField.fieldObjNum,
+        rect: resolvedRect,
+        pngBuffer: stampBuffer,
+        appearanceName: visibleSigConfig.appearanceName || stampOptions.appearanceName || 'ImStamp'
+      });
+      pdfBuffer = appearanceResult.pdf;
+      this._logDebug('PAdES.visibleSignature.applied', {
+        rect: resolvedRect,
+        pageObjNum: ensuredField.pageObjNum,
+        personName: resolvedName
+      });
+    }
 
     // KeyUsage kontrolü (auto fallback DocTS)
-    const leafDer = pemToDer(certPem);
     const { keyUsage = {}, eku = [] } = this._parseKeyUsageAndEKU(leafDer);
     const keyUsageBitsPresent = Object.values(keyUsage).some(Boolean);
     const canSignByKU = !keyUsageBitsPresent || keyUsage.digitalSignature || keyUsage.contentCommitment;
