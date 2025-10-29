@@ -207,7 +207,6 @@ class PAdESManager {
     const canSign = canSignByKU && !tsaOnly;
     this._logDebug('PAdES.keyUsage', { keyUsage, eku: ekuList, canSign, reason: canSign ? 'allowed' : 'disallowed' });
 
-    const normalizeFieldName = (name) => (typeof name === 'string' && name.length > 0 ? name : null);
     const resolvedDocTs = (() => {
       if (documentTimestamp && typeof documentTimestamp === 'object') {
         const append = !!documentTimestamp.append;
@@ -232,6 +231,56 @@ class PAdESManager {
       viaDocumentTimestampOption: !!documentTimestamp
     });
 
+    if (visibleSignature && typeof visibleSignature === 'object') {
+      const rectInput = visibleSignature.rect || visibleSignature.position;
+      if (!rectInput) {
+        throw new Error('visibleSignature.rect or visibleSignature.position must be provided');
+      }
+
+      let stampBuffer = visibleSignature.stampBuffer;
+      if (stampBuffer && !Buffer.isBuffer(stampBuffer)) {
+        throw new Error('visibleSignature.stampBuffer must be a Buffer');
+      }
+
+      if (!stampBuffer) {
+        let subjectName = '';
+        try {
+          subjectName = extractSubjectCommonName(leafDer) || '';
+        } catch (err) {
+          subjectName = '';
+          this._logDebug('PAdES.visibleSignature.subjectCN.error', { message: err.message });
+        }
+        const stampCfg = (visibleSignature && typeof visibleSignature.stamp === 'object') ? visibleSignature.stamp : {};
+        const stampInput = {
+          fontPath: stampCfg.fontPath || path.join(__dirname, 'font.ttf'),
+          pngLogoPath: stampCfg.pngLogoPath || path.join(__dirname, 'caduceus.png'),
+          personName: subjectName
+        };
+        if (typeof stampCfg.finalW === 'number') stampInput.finalW = stampCfg.finalW;
+        if (typeof stampCfg.finalH === 'number') stampInput.finalH = stampCfg.finalH;
+        if (typeof stampCfg.leftW === 'number') stampInput.leftW = stampCfg.leftW;
+        if (typeof stampCfg.rightW === 'number') stampInput.rightW = stampCfg.rightW;
+        if (typeof stampCfg.SS === 'number') stampInput.SS = stampCfg.SS;
+        if (stampCfg.outPath) stampInput.outPath = stampCfg.outPath;
+        stampBuffer = generateStamp(stampInput);
+      }
+
+      const pageIndexForAppearance = (visibleSignature.pageIndex == null) ? 0 : visibleSignature.pageIndex;
+      this._logDebug('PAdES.visibleSignature.apply', {
+        fieldName: visibleFieldName || ensureField,
+        pageIndex: pageIndexForAppearance,
+        hasCustomStamp: !!visibleSignature.stampBuffer,
+        rect: rectInput
+      });
+      pdfBuffer = applyVisibleSignatureStamp({
+        pdfBuffer,
+        fieldName: visibleFieldName,
+        rect: rectInput,
+        pageIndex: pageIndexForAppearance,
+        stampBuffer
+      });
+    }
+
     if (!canSign) {
       const docTsPlaceholderLen = resolvedDocTs.append ? resolvedDocTs.placeholderHexLen : placeholderHexLen;
       const fallbackField = resolvedDocTs.append ? resolvedDocTs.fieldName : normalizeFieldName(fieldName);
@@ -250,8 +299,9 @@ class PAdESManager {
 
     // PAdES-T akışı
     const writer = new PDFPAdESWriter(pdfBuffer);
-    writer.preparePlaceholder({ subFilter: 'adbe.pkcs7.detached', placeholderHexLen, fieldName });
-    this._logDebug('PAdES.preparePlaceholder', { fieldName: fieldName || 'Sig1', placeholderHexLen });
+    const placeholderFieldName = visibleFieldName || normalizedFieldName || null;
+    writer.preparePlaceholder({ subFilter: 'adbe.pkcs7.detached', placeholderHexLen, fieldName: placeholderFieldName });
+    this._logDebug('PAdES.preparePlaceholder', { fieldName: placeholderFieldName || 'Sig1', placeholderHexLen });
 
     // İmzalanacak veri özeti (algoritma sertifikanın eğrisine göre)
     const { recommendedHash } = parseCertBasics(leafDer);

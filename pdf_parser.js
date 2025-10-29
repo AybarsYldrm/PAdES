@@ -364,6 +364,21 @@ function _injectKeyRaw(dictStr, rawKV){
   return dictStr.replace(/>>\s*$/, ' ' + rawKV + ' >>');
 }
 
+function _replaceOrAppend(dictStr, regex, replacement){
+  if (regex.test(dictStr)) {
+    return dictStr.replace(regex, replacement);
+  }
+  return dictStr.replace(/>>\s*$/, ' ' + replacement + ' >>');
+}
+
+function _formatPdfNumber(num){
+  if (!Number.isFinite(num)) throw new Error('PDF number must be finite');
+  if (Number.isInteger(num)) return String(num);
+  const fixed = num.toFixed(6);
+  const trimmed = fixed.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
+}
+
 function _ensureDocTimeStampPerms(pdf, rootDict, docTsRef){
   let updatedRoot = rootDict;
   let rootChanged = false;
@@ -1493,6 +1508,137 @@ function findEmptySignatureField(pdf, rootObjNum, fieldName){
     return { objNum: n, dictStr: f.dictStr };
   }
   return null;
+}
+
+function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = null, stampBuffer }){
+  if (!Buffer.isBuffer(pdfBuffer)) throw new Error('pdfBuffer must be Buffer');
+  if (!Buffer.isBuffer(stampBuffer)) throw new Error('stampBuffer must be Buffer');
+
+  let normalizedRect;
+  if (Array.isArray(rect)) {
+    if (rect.length !== 4) throw new Error('visible signature rect must have 4 elements');
+    normalizedRect = rect.map(Number);
+  } else if (rect && typeof rect === 'object') {
+    const { x, y, width, height } = rect;
+    if (![x, y, width, height].every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      throw new Error('visible signature rect object must have finite x, y, width, height');
+    }
+    normalizedRect = [x, y, x + width, y + height];
+  } else {
+    throw new Error('visible signature rect must be an array [llx,lly,urx,ury] or an object {x,y,width,height}');
+  }
+  if (normalizedRect.some((n) => !Number.isFinite(n))) throw new Error('rect values must be finite numbers');
+  const [llx, lly, urx, ury] = normalizedRect;
+  if (urx <= llx || ury <= lly) throw new Error('rect must have positive width and height');
+
+  const width = urx - llx;
+  const height = ury - lly;
+
+  const meta = readLastTrailer(pdfBuffer);
+  const targetFieldName = (typeof fieldName === 'string' && fieldName.length > 0) ? fieldName : null;
+  const field = findEmptySignatureField(pdfBuffer, meta.rootObjNum, targetFieldName);
+  if (!field) throw new Error('Signature field not found or already contains a value');
+
+  const resolveWidgetObjNum = () => {
+    const kidsMatch = /\/Kids\s*\[([^\]]+)\]/.exec(field.dictStr);
+    if (kidsMatch) {
+      const widgetMatch = /(\d+)\s+0\s+R/.exec(kidsMatch[1]);
+      if (widgetMatch) return parseInt(widgetMatch[1], 10);
+    }
+    const fieldObj = readObject(pdfBuffer, field.objNum);
+    if (fieldObj && /\/Subtype\s*\/Widget\b/.test(fieldObj.dictStr)) {
+      return field.objNum;
+    }
+    return null;
+  };
+
+  const widgetObjNum = resolveWidgetObjNum();
+  if (!widgetObjNum) throw new Error('Signature widget annotation not found');
+
+  const widgetObj = readObject(pdfBuffer, widgetObjNum);
+  if (!widgetObj || !widgetObj.dictStr) throw new Error('Signature widget object missing');
+  let widgetDict = widgetObj.dictStr;
+
+  let pageRef = null;
+  const existingPageMatch = /\/P\s+(\d+)\s+0\s+R/.exec(widgetDict);
+  if (existingPageMatch) pageRef = existingPageMatch[1] + ' 0 R';
+
+  const requestedPageIndex = (pageIndex === null || pageIndex === undefined) ? null : pageIndex;
+  if (requestedPageIndex != null) {
+    if (!Number.isInteger(requestedPageIndex) || requestedPageIndex < 0) {
+      throw new Error('pageIndex must be a non-negative integer');
+    }
+    const pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
+    if (pageObjNum == null) throw new Error('Requested page index out of range for visible signature');
+    pageRef = pageObjNum + ' 0 R';
+  } else if (!pageRef) {
+    const fallbackPage = findPageObjNumByIndex(pdfBuffer, 0);
+    if (fallbackPage == null) throw new Error('Unable to locate any page for visible signature');
+    pageRef = fallbackPage + ' 0 R';
+  }
+
+  const png = parsePng(stampBuffer);
+  const imageData = zlib.deflateSync(png.pixelData);
+  const alphaData = png.alphaData ? zlib.deflateSync(png.alphaData) : null;
+
+  const state = getPdfState(pdfBuffer);
+  const xrefKeys = Array.from(state.xrefMap.keys());
+  const maxExisting = xrefKeys.length ? Math.max(...xrefKeys) : (meta.size - 1);
+  let nextObjNum = Math.max(meta.size, maxExisting + 1);
+
+  const newObjs = [];
+  let smaskObjNum = null;
+  if (alphaData) {
+    smaskObjNum = nextObjNum++;
+    const smaskDict = '<< /Type /XObject /Subtype /Image /Width ' + png.width + ' /Height ' + png.height + ' /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0 1] /Filter /FlateDecode /Length ' + alphaData.length + ' >>';
+    const smaskStream = smaskDict + '\nstream\n' + alphaData.toString('latin1') + '\nendstream';
+    newObjs.push({ objNum: smaskObjNum, contentStr: smaskStream });
+  }
+
+  const imageObjNum = nextObjNum++;
+  let imageDict = '<< /Type /XObject /Subtype /Image /Width ' + png.width + ' /Height ' + png.height + ' /ColorSpace /' + png.colorSpace + ' /BitsPerComponent ' + png.bitDepth + ' /Filter /FlateDecode /Length ' + imageData.length;
+  if (smaskObjNum) imageDict += ' /SMask ' + smaskObjNum + ' 0 R';
+  imageDict += ' >>';
+  const imageStream = imageDict + '\nstream\n' + imageData.toString('latin1') + '\nendstream';
+  newObjs.push({ objNum: imageObjNum, contentStr: imageStream });
+
+  const appearanceObjNum = nextObjNum++;
+  const rectWidthStr = _formatPdfNumber(width);
+  const rectHeightStr = _formatPdfNumber(height);
+  const appearanceContent = Buffer.from('q ' + rectWidthStr + ' 0 0 ' + rectHeightStr + ' 0 0 cm /Im1 Do Q', 'latin1');
+  const appearanceDict = '<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ' + rectWidthStr + ' ' + rectHeightStr + '] /Resources << /XObject << /Im1 ' + imageObjNum + ' 0 R >> >> /Length ' + appearanceContent.length + ' >>';
+  const appearanceStream = appearanceDict + '\nstream\n' + appearanceContent.toString('latin1') + '\nendstream';
+  newObjs.push({ objNum: appearanceObjNum, contentStr: appearanceStream });
+
+  widgetDict = _injectKeyRaw(widgetDict, '/Type /Annot');
+  widgetDict = _injectKeyRaw(widgetDict, '/Subtype /Widget');
+  widgetDict = _replaceOrAppend(widgetDict, /\/Rect\s*\[[^\]]*\]/, '/Rect [' + normalizedRect.map(_formatPdfNumber).join(' ') + ']');
+  widgetDict = _replaceOrAppend(widgetDict, /\/P\s+\d+\s+0\s+R/, '/P ' + pageRef);
+  widgetDict = _replaceOrAppend(widgetDict, /\/F\s+\d+/, '/F 4');
+  widgetDict = _replaceOrAppend(widgetDict, /\/AP\s*<<[\s\S]*?>>/, '/AP << /N ' + appearanceObjNum + ' 0 R >>');
+  if (!/\/AP\s*<<[\s\S]*?>>/.test(widgetDict)) {
+    widgetDict = widgetDict.replace(/>>\s*$/, ' /AP << /N ' + appearanceObjNum + ' 0 R >> >>');
+  }
+  if (!/\/P\s+\d+\s+0\s+R/.test(widgetDict)) {
+    widgetDict = widgetDict.replace(/>>\s*$/, ' /P ' + pageRef + ' >>');
+  }
+  if (!/\/F\s+\d+/.test(widgetDict)) {
+    widgetDict = widgetDict.replace(/>>\s*$/, ' /F 4 >>');
+  }
+  if (!/\/Rect\s*\[/.test(widgetDict)) {
+    widgetDict = widgetDict.replace(/>>\s*$/, ' /Rect [' + normalizedRect.map(_formatPdfNumber).join(' ') + '] >>');
+  }
+
+  newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+
+  const highestObj = newObjs.reduce((max, o) => Math.max(max, o.objNum), maxExisting);
+  const newSize = Math.max(meta.size, highestObj + 1);
+
+  return _appendXrefTrailer(pdfBuffer, newObjs, {
+    size: newSize,
+    rootRef: meta.rootRef,
+    prevXref: meta.startxref
+  });
 }
 
 /* --------------------------------- exports --------------------------------- */
