@@ -45,6 +45,70 @@ function parseCertBasics(certDer){
   return { issuerFullDER, serialContent, spkiAlgOid, ecCurveOid, recommendedHash };
 }
 
+function _decodeASN1String(valueBuf, tag){
+  switch (tag) {
+    case 0x0C: // UTF8String
+      return valueBuf.toString('utf8');
+    case 0x13: // PrintableString
+    case 0x14: // T61String (treat as latin1)
+    case 0x16: // IA5String
+      return valueBuf.toString('latin1');
+    case 0x1E: { // BMPString (UTF-16BE)
+      let out = '';
+      for (let i = 0; i + 1 < valueBuf.length; i += 2) {
+        out += String.fromCharCode((valueBuf[i] << 8) | valueBuf[i + 1]);
+      }
+      return out;
+    }
+    default:
+      return valueBuf.toString('utf8');
+  }
+}
+
+function extractSubjectCommonName(certDer){
+  let top = readTLV(certDer, 0);
+  if (top.tag !== 0x30) throw new Error('bad cert outer');
+  let p = top.start;
+  const tbs = readTLV(certDer, p);
+  if (tbs.tag !== 0x30) throw new Error('bad tbs');
+  p = tbs.start;
+
+  let v = readTLV(certDer, p);
+  if (v.tag === 0xA0) p = v.next; // version
+  p = readTLV(certDer, p).next; // serial
+  p = readTLV(certDer, p).next; // signature algorithm
+  p = readTLV(certDer, p).next; // issuer
+  p = readTLV(certDer, p).next; // validity
+
+  const subject = readTLV(certDer, p);
+  if (subject.tag !== 0x30) throw new Error('no subject');
+
+  let sp = subject.start;
+  while (sp < subject.end) {
+    const rdnSet = readTLV(certDer, sp);
+    sp = rdnSet.next;
+    if (rdnSet.tag !== 0x31) continue;
+
+    let attrPos = rdnSet.start;
+    while (attrPos < rdnSet.end) {
+      const attr = readTLV(certDer, attrPos);
+      attrPos = attr.next;
+      if (attr.tag !== 0x30) continue;
+
+      const oidT = readTLV(certDer, attr.start);
+      if (oidT.tag !== 0x06) continue;
+      const oid = oidFromBytes(certDer.slice(oidT.start, oidT.end));
+
+      const valueT = readTLV(certDer, oidT.next);
+      if (oid === '2.5.4.3') { // commonName
+        const valueBuf = certDer.slice(valueT.start, valueT.end);
+        return _decodeASN1String(valueBuf, valueT.tag).trim();
+      }
+    }
+  }
+  return null;
+}
+
 /** Minimal KeyUsage & EKU parse (digitalSignature / contentCommitment / keyAgreement) */
 function parseKeyUsageAndEKU(certDer){
   function tlv(buf,pos){ const t=buf[pos]; let l=buf[pos+1], n=1; if(l&0x80){const k=l&0x7F; l=0; for(let i=0;i<k;i++) l=(l<<8)|buf[pos+2+i]; n=1+k;} const s=pos+1+n, e=s+l; return {t,l,h:1+n,s,e,nxt:e}; }
@@ -89,83 +153,4 @@ function parseKeyUsageAndEKU(certDer){
   return out;
 }
 
-function decodeASN1String(valueBuf, tag){
-  if (tag === 0x0C) { // UTF8String
-    return Buffer.from(valueBuf).toString('utf8');
-  }
-  if (tag === 0x13 || tag === 0x16 || tag === 0x1A) { // PrintableString, IA5String, VisibleString
-    return Buffer.from(valueBuf).toString('latin1');
-  }
-  if (tag === 0x1E) { // BMPString (UTF-16BE)
-    const bytes = Buffer.from(valueBuf);
-    const chars = [];
-    for (let i = 0; i + 1 < bytes.length; i += 2) {
-      chars.push(String.fromCharCode((bytes[i] << 8) | bytes[i + 1]));
-    }
-    return chars.join('');
-  }
-  if (tag === 0x1C) { // UniversalString (UTF-32BE)
-    const bytes = Buffer.from(valueBuf);
-    const chars = [];
-    for (let i = 0; i + 3 < bytes.length; i += 4) {
-      const code = (bytes[i] << 24) | (bytes[i + 1] << 16) | (bytes[i + 2] << 8) | bytes[i + 3];
-      chars.push(String.fromCodePoint(code >>> 0));
-    }
-    return chars.join('');
-  }
-  // Default fallback: latin1
-  return Buffer.from(valueBuf).toString('latin1');
-}
-
-function extractSubjectAttributes(certDer){
-  const outer = readTLV(certDer, 0); if (outer.tag !== 0x30) throw new Error('bad cert outer');
-  const tbs = readTLV(certDer, outer.start); if (tbs.tag !== 0x30) throw new Error('bad tbs');
-  let p = tbs.start;
-  let v = readTLV(certDer, p); if (v.tag === 0xA0) p = v.next; // version
-  p = readTLV(certDer, p).next; // serial
-  p = readTLV(certDer, p).next; // sigalg
-  p = readTLV(certDer, p).next; // issuer
-  p = readTLV(certDer, p).next; // validity
-  const subjectTLV = readTLV(certDer, p); if (subjectTLV.tag !== 0x30) throw new Error('no subject');
-
-  const subjectBuf = certDer.slice(subjectTLV.start - subjectTLV.hdr, subjectTLV.end);
-  const attrs = [];
-  const seq = readTLV(subjectBuf, 0); if (seq.tag !== 0x30) return attrs;
-  let cursor = seq.start;
-  while (cursor < seq.end){
-    const set = readTLV(subjectBuf, cursor); cursor = set.next;
-    if (set.tag !== 0x31) continue; // SET
-    let sp = set.start;
-    while (sp < set.end){
-      const av = readTLV(subjectBuf, sp); sp = av.next;
-      if (av.tag !== 0x30) continue;
-      const oidTLV = readTLV(subjectBuf, av.start);
-      if (oidTLV.tag !== 0x06) continue;
-      const valueTLV = readTLV(subjectBuf, oidTLV.next);
-      const oid = oidFromBytes(subjectBuf.slice(oidTLV.start, oidTLV.end));
-      const value = decodeASN1String(subjectBuf.slice(valueTLV.start, valueTLV.end), valueTLV.tag);
-      attrs.push({ oid, value });
-    }
-  }
-  return attrs;
-}
-
-function extractSubjectCommonName(certDer){
-  try {
-    const attrs = extractSubjectAttributes(certDer);
-    const cnAttr = attrs.find((attr) => attr.oid === '2.5.4.3');
-    return cnAttr ? cnAttr.value : null;
-  } catch (_err) {
-    return null;
-  }
-}
-
-module.exports = {
-  pemToDer,
-  parseCertBasics,
-  parseKeyUsageAndEKU,
-  readTLV,
-  oidFromBytes,
-  extractSubjectAttributes,
-  extractSubjectCommonName
-};
+module.exports = { pemToDer, parseCertBasics, parseKeyUsageAndEKU, readTLV, oidFromBytes, extractSubjectCommonName };
