@@ -31,6 +31,20 @@ const { PAdESManager } = require('./pades_manager');
       fieldName: null,
       placeholderHexLen: 60000,
       documentTimestamp: { append: false },
+      visibleSignature: {
+        pageIndex: 0,
+        rect: [50, 50, 350, 200],
+        appearanceName: 'StampImage',
+        stamp: {
+          fontPath: path.join(baseDir, 'font.ttf'),
+          pngLogoPath: path.join(baseDir, 'caduceus.png'),
+          finalW: 1280,
+          finalH: 320,
+          leftW: 560,
+          rightW: 720,
+          SS: 4
+        }
+      }
     });
     fs.writeFileSync(OUT_PADES_T, pdf);
     console.log('OK', mode, '→', OUT_PADES_T);
