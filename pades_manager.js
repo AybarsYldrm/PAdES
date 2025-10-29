@@ -61,7 +61,8 @@ class PAdESManager {
     let workingPdf = pdfBuffer;
 
     if (normalizedFieldName) {
-      workingPdf = ensureAcroFormAndEmptySigField(workingPdf, normalizedFieldName);
+      const ensured = ensureAcroFormAndEmptySigField(workingPdf, normalizedFieldName);
+      workingPdf = ensured.pdf;
     }
 
     const writer = new PDFPAdESWriter(workingPdf);
