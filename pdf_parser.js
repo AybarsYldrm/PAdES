@@ -1568,13 +1568,36 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
     if (!Number.isInteger(requestedPageIndex) || requestedPageIndex < 0) {
       throw new Error('pageIndex must be a non-negative integer');
     }
-    const pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
-    if (pageObjNum == null) throw new Error('Requested page index out of range for visible signature');
-    pageRef = pageObjNum + ' 0 R';
+    try {
+      const pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
+      if (pageObjNum == null) throw new Error('Requested page index out of range for visible signature');
+      pageRef = pageObjNum + ' 0 R';
+    } catch (_err) {
+      // Sayfa dizini hatalarında en azından ilk sayfaya düş
+      try {
+        const fallbackPage = findFirstPageObjNumSafe(pdfBuffer);
+        if (fallbackPage != null) {
+          pageRef = fallbackPage + ' 0 R';
+        }
+      } catch (_err2) {
+        const scanned = _findFirstPageByScan(pdfBuffer);
+        if (scanned != null) pageRef = scanned + ' 0 R';
+      }
+      if (!pageRef) throw _err;
+    }
   } else if (!pageRef) {
-    const fallbackPage = findPageObjNumByIndex(pdfBuffer, 0);
-    if (fallbackPage == null) throw new Error('Unable to locate any page for visible signature');
-    pageRef = fallbackPage + ' 0 R';
+    try {
+      const fallbackPage = findPageObjNumByIndex(pdfBuffer, 0);
+      if (fallbackPage == null) throw new Error('Unable to locate any page for visible signature');
+      pageRef = fallbackPage + ' 0 R';
+    } catch (err) {
+      const scanned = _findFirstPageByScan(pdfBuffer);
+      if (scanned != null) {
+        pageRef = scanned + ' 0 R';
+      } else {
+        throw err;
+      }
+    }
   }
 
   const png = parsePng(stampBuffer);
