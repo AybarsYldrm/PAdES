@@ -1,11 +1,19 @@
 'use strict';
+const path = require('path');
 const crypto = require('crypto');
-const { PDFPAdESWriter, ensureAcroFormAndEmptySigField, applyVisibleSignatureAppearance } = require('./pdf_parser');
+const { PDFPAdESWriter, ensureAcroFormAndEmptySigField, applyVisibleSignatureAppearance, applyVisibleSignatureStamp } = require('./pdf_parser');
 const { pemToDer, parseCertBasics, parseKeyUsageAndEKU, extractSubjectCommonName } = require('./x509_extract');
 const { buildTSQ, requestTimestamp, extractTimeStampTokenOrThrow } = require('./rfc3161');
 const { OIDS } = require('./oids');
 const { buildCAdES_BES_auto, addUnsignedAttr_signatureTimeStampToken, buildSignedData } = require('./cades_builder');
 const { generateStamp } = require('./stamp');
+
+function normalizeFieldName(name) {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^\//, '');
+}
 
 // TSA hash adı -> OID
 const HASH_NAME_TO_OID = {
@@ -134,6 +142,9 @@ class PAdESManager {
 
     const leafDer = pemToDer(certPem);
     const subjectCommonName = extractSubjectCommonName(leafDer);
+    const normalizedFieldName = normalizeFieldName(fieldName);
+    const targetFieldName = normalizedFieldName || 'Sig1';
+    const visibleFieldName = targetFieldName;
 
     const visibleSigConfig = (visibleSignature && typeof visibleSignature === 'object') ? visibleSignature : null;
     const ensureOptions = {};
@@ -155,7 +166,7 @@ class PAdESManager {
       }
     }
 
-    const ensuredField = ensureAcroFormAndEmptySigField(pdfBuffer, fieldName || 'Sig1', ensureOptions);
+    const ensuredField = ensureAcroFormAndEmptySigField(pdfBuffer, targetFieldName, ensureOptions);
     pdfBuffer = ensuredField.pdf;
 
     if (visibleSigConfig && resolvedRect) {
@@ -267,7 +278,7 @@ class PAdESManager {
 
       const pageIndexForAppearance = (visibleSignature.pageIndex == null) ? 0 : visibleSignature.pageIndex;
       this._logDebug('PAdES.visibleSignature.apply', {
-        fieldName: visibleFieldName || ensureField,
+        fieldName: visibleFieldName,
         pageIndex: pageIndexForAppearance,
         hasCustomStamp: !!visibleSignature.stampBuffer,
         rect: rectInput
