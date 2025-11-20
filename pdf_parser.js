@@ -1626,6 +1626,22 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
   let nextObjNum = Math.max(meta.size, maxExisting + 1);
 
   const newObjs = [];
+  const ensurePageContainsWidget = (pageRefStr) => {
+    const pageMatch = /^(\d+)\s+0\s+R$/.exec(pageRefStr || '');
+    if (!pageMatch) return;
+    const pageObjNum = parseInt(pageMatch[1], 10);
+    const pageObj = readObject(pdfBuffer, pageObjNum);
+    if (!pageObj || !pageObj.dictStr) return;
+    const updated = _appendUniqueRef(pageObj.dictStr, '/Annots', widgetObjNum);
+    if (updated !== pageObj.dictStr) {
+      const existingUpdate = newObjs.find((o) => o.objNum === pageObjNum);
+      if (existingUpdate) {
+        existingUpdate.contentStr = updated;
+      } else {
+        newObjs.push({ objNum: pageObjNum, contentStr: updated });
+      }
+    }
+  };
   let smaskObjNum = null;
   if (alphaData) {
     smaskObjNum = nextObjNum++;
@@ -1663,6 +1679,10 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
   if (!/\/AP\s*<<[\s\S]*?>>/.test(widgetDict)) {
     widgetDict = widgetDict.replace(/>>\s*$/, ' /AP << /N ' + appearanceObjNum + ' 0 R >> >>');
   }
+  widgetDict = _replaceOrAppend(widgetDict, /\/AS\s+\/?\w+/, '/AS /N');
+  if (!/\/AS\s+\/?\w+/.test(widgetDict)) {
+    widgetDict = widgetDict.replace(/>>\s*$/, ' /AS /N >>');
+  }
   if (!/\/P\s+\d+\s+0\s+R/.test(widgetDict)) {
     widgetDict = widgetDict.replace(/>>\s*$/, ' /P ' + pageRef + ' >>');
   }
@@ -1674,6 +1694,7 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
   }
 
   newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+  ensurePageContainsWidget(pageRef);
 
   const highestObj = newObjs.reduce((max, o) => Math.max(max, o.objNum), maxExisting);
   const newSize = Math.max(meta.size, highestObj + 1);

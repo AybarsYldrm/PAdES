@@ -15,6 +15,13 @@ function normalizeFieldName(name) {
   return trimmed.replace(/^\//, '');
 }
 
+function normalizeFieldName(name) {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^\//, '');
+}
+
 // TSA hash adı -> OID
 const HASH_NAME_TO_OID = {
   sha256: OIDS.sha256,
@@ -148,6 +155,7 @@ class PAdESManager {
     const visibleReason = (visibleSignature && typeof visibleSignature === 'object' && typeof visibleSignature.reason === 'string')
       ? visibleSignature.reason
       : null;
+    let resolvedStampName = null;
 
     const visibleSigConfig = (visibleSignature && typeof visibleSignature === 'object') ? visibleSignature : null;
     const ensureOptions = {};
@@ -210,6 +218,7 @@ class PAdESManager {
         pageObjNum: ensuredField.pageObjNum,
         personName: resolvedName
       });
+      resolvedStampName = resolvedName;
     }
 
     // KeyUsage kontrolü (auto fallback DocTS)
@@ -277,6 +286,9 @@ class PAdESManager {
         if (typeof stampCfg.SS === 'number') stampInput.SS = stampCfg.SS;
         if (stampCfg.outPath) stampInput.outPath = stampCfg.outPath;
         stampBuffer = generateStamp(stampInput);
+        if (!resolvedStampName) {
+          resolvedStampName = stampInput.personName;
+        }
       }
 
       const pageIndexForAppearance = (visibleSignature.pageIndex == null) ? 0 : visibleSignature.pageIndex;
@@ -314,11 +326,12 @@ class PAdESManager {
     // PAdES-T akışı
     const writer = new PDFPAdESWriter(pdfBuffer);
     const placeholderFieldName = visibleFieldName || normalizedFieldName || null;
+    const signerDisplayName = resolvedStampName || subjectCommonName || null;
     writer.preparePlaceholder({
       subFilter: 'adbe.pkcs7.detached',
       placeholderHexLen,
       fieldName: placeholderFieldName,
-      signerName: subjectCommonName || undefined,
+      signerName: signerDisplayName || undefined,
       reason: visibleReason || undefined
     });
     this._logDebug('PAdES.preparePlaceholder', { fieldName: placeholderFieldName || 'Sig1', placeholderHexLen });
