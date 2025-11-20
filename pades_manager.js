@@ -15,6 +15,13 @@ function normalizeFieldName(name) {
   return trimmed.replace(/^\//, '');
 }
 
+function normalizeFieldName(name) {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^\//, '');
+}
+
 // TSA hash adı -> OID
 const HASH_NAME_TO_OID = {
   sha256: OIDS.sha256,
