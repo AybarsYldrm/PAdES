@@ -145,6 +145,9 @@ class PAdESManager {
     const normalizedFieldName = normalizeFieldName(fieldName);
     const targetFieldName = normalizedFieldName || 'Sig1';
     const visibleFieldName = targetFieldName;
+    const visibleReason = (visibleSignature && typeof visibleSignature === 'object' && typeof visibleSignature.reason === 'string')
+      ? visibleSignature.reason
+      : null;
 
     const visibleSigConfig = (visibleSignature && typeof visibleSignature === 'object') ? visibleSignature : null;
     const ensureOptions = {};
@@ -311,7 +314,13 @@ class PAdESManager {
     // PAdES-T akışı
     const writer = new PDFPAdESWriter(pdfBuffer);
     const placeholderFieldName = visibleFieldName || normalizedFieldName || null;
-    writer.preparePlaceholder({ subFilter: 'adbe.pkcs7.detached', placeholderHexLen, fieldName: placeholderFieldName });
+    writer.preparePlaceholder({
+      subFilter: 'adbe.pkcs7.detached',
+      placeholderHexLen,
+      fieldName: placeholderFieldName,
+      signerName: subjectCommonName || undefined,
+      reason: visibleReason || undefined
+    });
     this._logDebug('PAdES.preparePlaceholder', { fieldName: placeholderFieldName || 'Sig1', placeholderHexLen });
 
     // İmzalanacak veri özeti (algoritma sertifikanın eğrisine göre)

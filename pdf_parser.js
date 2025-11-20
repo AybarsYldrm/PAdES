@@ -17,6 +17,16 @@ function _requirePdfBuffer(value, label) {
   throw new Error((label || 'pdfBuffer') + ' must be a Buffer or Uint8Array');
 }
 
+function _escapePdfString(str) {
+  if (typeof str !== 'string' || !str.length) return '';
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
+
 function getPdfState(pdf){
   const buf = _requirePdfBuffer(pdf, 'pdf');
   let state = PDF_STATE_CACHE.get(buf);
@@ -1026,6 +1036,9 @@ class PDFPAdESWriter {
       placeholderHexLen += 1;
     }
     var fieldName = opts.fieldName || null;
+    const signerName = typeof opts.signerName === 'string' ? opts.signerName : null;
+    const reason = typeof opts.reason === 'string' ? opts.reason : null;
+    const contactInfo = typeof opts.contactInfo === 'string' ? opts.contactInfo : null;
 
     const acro = locateAcroForm(this.pdf, this.rootObjNum);
     if (!acro) throw new Error('/AcroForm not found. Provide at least one empty /Sig field.');
@@ -1065,7 +1078,10 @@ class PDFPAdESWriter {
     const BR = '0000000000 0000000000 0000000000 0000000000';
 
     const pPart = pageRefStr ? (' /P ' + pageRefStr) : '';
-    const sigDict = '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /' + subFilter + pPart +
+    const namePart = signerName ? (' /Name (' + _escapePdfString(signerName) + ')') : '';
+    const reasonPart = reason ? (' /Reason (' + _escapePdfString(reason) + ')') : '';
+    const contactPart = contactInfo ? (' /ContactInfo (' + _escapePdfString(contactInfo) + ')') : '';
+    const sigDict = '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /' + subFilter + pPart + namePart + reasonPart + contactPart +
                     ' /ByteRange [' + BR + '] /Contents <' + placeholderHex + '> /M (' + dateStr + ') >>';
 
     const fieldOrig = readObject(this.pdf, fieldObjNum);
@@ -1628,7 +1644,12 @@ function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = nu
   const appearanceObjNum = nextObjNum++;
   const rectWidthStr = _formatPdfNumber(width);
   const rectHeightStr = _formatPdfNumber(height);
-  const appearanceContent = Buffer.from('q ' + rectWidthStr + ' 0 0 ' + rectHeightStr + ' 0 0 cm /Im1 Do Q', 'latin1');
+  const scale = Math.min(width / png.width, height / png.height);
+  const drawnW = _formatPdfNumber(png.width * scale);
+  const drawnH = _formatPdfNumber(png.height * scale);
+  const offsetX = _formatPdfNumber((width - (png.width * scale)) / 2);
+  const offsetY = _formatPdfNumber((height - (png.height * scale)) / 2);
+  const appearanceContent = Buffer.from('q ' + drawnW + ' 0 0 ' + drawnH + ' ' + offsetX + ' ' + offsetY + ' cm /Im1 Do Q', 'latin1');
   const appearanceDict = '<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ' + rectWidthStr + ' ' + rectHeightStr + '] /Resources << /XObject << /Im1 ' + imageObjNum + ' 0 R >> >> /Length ' + appearanceContent.length + ' >>';
   const appearanceStream = appearanceDict + '\nstream\n' + appearanceContent.toString('latin1') + '\nendstream';
   newObjs.push({ objNum: appearanceObjNum, contentStr: appearanceStream });
