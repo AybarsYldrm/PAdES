@@ -1647,6 +1647,7 @@ module.exports = {
   PDFPAdESWriter,
   ensureAcroFormAndEmptySigField,
   applyVisibleSignatureAppearance,
+  applyVisibleSignatureStamp,
   readLastTrailer,
   readObject
 };
