@@ -27,6 +27,16 @@ function _escapePdfString(str) {
     .replace(/\n/g, '\\n');
 }
 
+function _escapePdfString(str) {
+  if (typeof str !== 'string' || !str.length) return '';
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
+
 function getPdfState(pdf){
   const buf = _requirePdfBuffer(pdf, 'pdf');
   let state = PDF_STATE_CACHE.get(buf);
