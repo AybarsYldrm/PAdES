@@ -2,129 +2,16 @@
 const fs = require('fs');
 const path = require('path');
 const { PAdESManager } = require('./pades_manager');
-const { generateStampPNG } = require('./stamp');
+const { buildSignatureImageBuffer } = require('./signature_assets');
+const {
+  DEFAULT_SIGNATURE_ORIGIN,
+  DEFAULT_SIGNATURE_POSITION,
+  parseSignaturePositions
+} = require('./signature_positions');
+const { parseBoolean, formatDateTR } = require('./signature_utils');
 
-const DEFAULT_SIGNATURE_POSITION = { x: 430, y: 130, width: 80 };
 const DEFAULT_SIGNATURE_NAME = 'Aybars';
 const DEFAULT_TEXT_TEMPLATE = 'İmzalayan: {{CN}}\nTarih: {{DATE}}';
-const DEFAULT_SIGNATURE_ORIGIN = 'bottom-left';
-
-const parseBoolean = (value, fallback) => {
-  if (value === undefined || value === null) {
-    return fallback;
-  }
-  if (typeof value === 'boolean') {
-    return value;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) {
-    return false;
-  }
-  return fallback;
-};
-
-const parseNumber = (value) => {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : null;
-};
-
-const parsePositionValues = (value) => {
-  if (!value) {
-    return null;
-  }
-  const normalized = String(value).trim();
-  const originSplit = normalized.split(':');
-  const originCandidate = originSplit.length > 1 ? originSplit.shift().trim() : null;
-  const coordString = originSplit.join(':').trim();
-  const parts = coordString
-    .split(/[,\s]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  if (parts.length < 3) {
-    return null;
-  }
-  const [x, y, width, height] = parts.map(parseNumber);
-  if (x === null || y === null || width === null) {
-    return null;
-  }
-  const rect = { x, y, width };
-  if (originCandidate) {
-    rect.origin = originCandidate;
-  }
-  if (height !== null) {
-    rect.height = height;
-  }
-  return rect;
-};
-
-const parseSignaturePositions = (value, fallbackDefault) => {
-  const coordinateMap = {};
-  let defaultPosition = fallbackDefault;
-
-  if (!value) {
-    return { coordinateMap, defaultPosition };
-  }
-
-  const trimmed = String(value).trim();
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === 'object') {
-        if (parsed.defaultPosition) {
-          defaultPosition = parsed.defaultPosition;
-        }
-        if (parsed.coordinateMap && typeof parsed.coordinateMap === 'object') {
-          Object.assign(coordinateMap, parsed.coordinateMap);
-        }
-      }
-      return { coordinateMap, defaultPosition };
-    } catch (error) {
-      console.warn('SIGNATURE_POSITIONS JSON parse failed:', error.message);
-    }
-  }
-
-  const entries = trimmed.split(';').map((item) => item.trim()).filter(Boolean);
-  for (const entry of entries) {
-    const [namePartRaw, coordsPart] = entry.split('=').map((item) => item.trim());
-    if (!coordsPart) {
-      continue;
-    }
-    const [namePart, originPart] = namePartRaw ? namePartRaw.split('@').map((item) => item.trim()) : [];
-    const rect = parsePositionValues(coordsPart);
-    if (!rect) {
-      continue;
-    }
-    if (originPart) {
-      rect.origin = originPart;
-    }
-    if (!namePart || namePart.toLowerCase() === 'default') {
-      defaultPosition = rect;
-    } else {
-      coordinateMap[namePart] = rect;
-    }
-  }
-
-  return { coordinateMap, defaultPosition };
-};
-
-const formatDate = () => {
-  const now = new Date();
-  return now.toLocaleString('tr-TR', { hour12: false });
-};
-
-const generateSignatureImageBuffer = ({ baseDir, outPath, signerName }) => {
-  const fontPath = path.join(baseDir, 'font.ttf');
-  const logoPath = path.join(baseDir, 'caduceus.png');
-  return generateStampPNG({
-    fontPath,
-    pngLogoPath: logoPath,
-    personName: signerName,
-    outPath
-  });
-};
 
 (async () => {
   const baseDir = __dirname;
@@ -139,7 +26,7 @@ const generateSignatureImageBuffer = ({ baseDir, outPath, signerName }) => {
     : null;
   let signatureImageBuffer = null;
   try {
-    signatureImageBuffer = generateSignatureImageBuffer({
+    signatureImageBuffer = buildSignatureImageBuffer({
       baseDir,
       outPath: signatureOutputPath,
       signerName
@@ -150,13 +37,17 @@ const generateSignatureImageBuffer = ({ baseDir, outPath, signerName }) => {
 
   const textEnabled = parseBoolean(process.env.SIGNATURE_TEXT_ENABLED, true);
   const textTemplate = process.env.SIGNATURE_TEXT_TEMPLATE || DEFAULT_TEXT_TEMPLATE;
-  const resolvedTextTemplate = textTemplate.replace(/\{\{\s*DATE\s*\}\}/g, formatDate());
+  const resolvedTextTemplate = textTemplate.replace(/\{\{\s*DATE\s*\}\}/g, formatDateTR());
   const defaultOrigin = process.env.SIGNATURE_ORIGIN || DEFAULT_SIGNATURE_ORIGIN;
+  const useCertificateCN = parseBoolean(process.env.SIGNATURE_USE_CN, true);
 
-  const signaturePositions = parseSignaturePositions(process.env.SIGNATURE_POSITIONS, {
-    ...DEFAULT_SIGNATURE_POSITION,
-    origin: defaultOrigin
-  });
+  const signaturePositions = parseSignaturePositions(
+    process.env.SIGNATURE_POSITIONS,
+    {
+      ...DEFAULT_SIGNATURE_POSITION,
+      origin: defaultOrigin
+    }
+  );
 
   const visibleSignatureConfig = signatureImageBuffer
     ? {
@@ -165,6 +56,8 @@ const generateSignatureImageBuffer = ({ baseDir, outPath, signerName }) => {
         defaultPosition: signaturePositions.defaultPosition,
         textTemplate: textEnabled ? resolvedTextTemplate : undefined,
         textLines: textEnabled ? undefined : [],
+        useCertificateCN,
+        cnFallbackEnabled: textEnabled,
         textFontSize: 9,
         textMinFontSize: 8,
         textFontStep: 0.5,
