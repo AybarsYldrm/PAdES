@@ -1,53 +1,22 @@
 'use strict';
 const crypto = require('crypto');
 const zlib = require('zlib');
+
 const { parsePng } = require('./png_decoder');
 
 const PDF_STATE_CACHE = new WeakMap();
 
-function _requirePdfBuffer(value, label) {
-  if (Buffer.isBuffer(value)) return value;
-  if (ArrayBuffer.isView(value)) {
-    const view = value;
-    return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
-  }
-  if (value instanceof ArrayBuffer) {
-    return Buffer.from(value);
-  }
-  throw new Error((label || 'pdfBuffer') + ' must be a Buffer or Uint8Array');
-}
-
-function _escapePdfString(str) {
-  if (typeof str !== 'string' || !str.length) return '';
-  return str
-    .replace(/\\/g, '\\\\')
-    .replace(/\(/g, '\\(')
-    .replace(/\)/g, '\\)')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
-}
-
-function _escapePdfString(str) {
-  if (typeof str !== 'string' || !str.length) return '';
-  return str
-    .replace(/\\/g, '\\\\')
-    .replace(/\(/g, '\\(')
-    .replace(/\)/g, '\\)')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
-}
-
 function getPdfState(pdf){
-  const buf = _requirePdfBuffer(pdf, 'pdf');
-  let state = PDF_STATE_CACHE.get(buf);
+  if (!Buffer.isBuffer(pdf)) throw new Error('pdf must be Buffer');
+  let state = PDF_STATE_CACHE.get(pdf);
   if (state) return state;
 
-  const pdfStr = buf.toString('latin1');
+  const pdfStr = pdf.toString('latin1');
   const meta = _parseLastTrailer(pdfStr);
   const xrefMap = _buildXrefMap(pdfStr, meta.startxref);
 
   state = { pdfStr, meta, xrefMap };
-  PDF_STATE_CACHE.set(buf, state);
+  PDF_STATE_CACHE.set(pdf, state);
   return state;
 }
 
@@ -162,7 +131,6 @@ function _buildXrefMap(str, startxref){
 /* ------------------------- Basit PDF yardımcıları ------------------------- */
 
 function readLastTrailer(pdf){
-  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { meta } = state;
   return {
@@ -175,7 +143,6 @@ function readLastTrailer(pdf){
 
 /* ---- DENGELİ sözlük okuyan geliştirilmiş readObject (iç içe << >> destekler) ---- */
 function readObject(pdf, objNum){
-  pdf = _requirePdfBuffer(pdf, 'pdf');
   const state = getPdfState(pdf);
   const { pdfStr, xrefMap } = state;
   let offset = xrefMap.get(objNum);
@@ -307,69 +274,6 @@ function _findFirstPageByScan(pdf){
   return null;
 }
 
-function _countPagesUnder(pdf, objNum, visited = new Set()){
-  if (visited.has(objNum)) return 0;
-  visited.add(objNum);
-  const obj = readObject(pdf, objNum);
-  if (!obj) return 0;
-  if (_dictHasType(obj.dictStr, 'Page')) return 1;
-  if (!_dictHasType(obj.dictStr, 'Pages')) return 0;
-  const kids = _extractRefArray(obj.dictStr, '/Kids');
-  let total = 0;
-  for (let i = 0; i < kids.length; i++){
-    total += _countPagesUnder(pdf, kids[i], visited);
-  }
-  return total;
-}
-
-function _findPageByIndex(pdf, objNum, targetIndex){
-  const obj = readObject(pdf, objNum);
-  if (!obj) return null;
-  if (_dictHasType(obj.dictStr, 'Page')) {
-    return targetIndex === 0 ? { pageObjNum: objNum } : null;
-  }
-  if (!_dictHasType(obj.dictStr, 'Pages')) return null;
-  const kids = _extractRefArray(obj.dictStr, '/Kids');
-  let remaining = targetIndex;
-  for (let i = 0; i < kids.length; i++){
-    const kid = kids[i];
-    const kidObj = readObject(pdf, kid);
-    if (!kidObj) continue;
-    if (_dictHasType(kidObj.dictStr, 'Page')) {
-      if (remaining === 0) return { pageObjNum: kid };
-      remaining -= 1;
-      continue;
-    }
-    if (_dictHasType(kidObj.dictStr, 'Pages')) {
-      const countMatch = /\/Count\s+(\d+)/.exec(kidObj.dictStr);
-      const childCount = countMatch ? parseInt(countMatch[1], 10) : _countPagesUnder(pdf, kid);
-      if (!Number.isInteger(childCount) || childCount < 0) {
-        continue;
-      }
-      if (remaining < childCount) {
-        return _findPageByIndex(pdf, kid, remaining);
-      }
-      remaining -= childCount;
-    }
-  }
-  return null;
-}
-
-function findPageObjNumByIndex(pdf, pageIndex){
-  if (typeof pageIndex !== 'number' || pageIndex < 0) throw new Error('pageIndex must be >= 0');
-  const meta = readLastTrailer(pdf);
-  const catalog = readObject(pdf, meta.rootObjNum);
-  if (!catalog) throw new Error('Catalog (Root) not found');
-  const pagesRef = /\/Pages\s+(\d+)\s+0\s+R/.exec(catalog.dictStr);
-  if (!pagesRef) throw new Error('Catalog has no /Pages');
-  const pagesNum = parseInt(pagesRef[1], 10);
-  const result = _findPageByIndex(pdf, pagesNum, pageIndex);
-  if (!result || typeof result.pageObjNum !== 'number') {
-    throw new Error('Page index out of range');
-  }
-  return result.pageObjNum;
-}
-
 /* -------------------- AcroForm/Sig & Widget inşa yardımcıları -------------------- */
 
 function _injectKeyRef(dictStr, key, valueRef){
@@ -382,21 +286,6 @@ function _injectKeyRaw(dictStr, rawKV){
   const re = new RegExp(k.replace('/', '\\/') + '\\b');
   if (re.test(dictStr)) return dictStr;
   return dictStr.replace(/>>\s*$/, ' ' + rawKV + ' >>');
-}
-
-function _replaceOrAppend(dictStr, regex, replacement){
-  if (regex.test(dictStr)) {
-    return dictStr.replace(regex, replacement);
-  }
-  return dictStr.replace(/>>\s*$/, ' ' + replacement + ' >>');
-}
-
-function _formatPdfNumber(num){
-  if (!Number.isFinite(num)) throw new Error('PDF number must be finite');
-  if (Number.isInteger(num)) return String(num);
-  const fixed = num.toFixed(6);
-  const trimmed = fixed.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
-  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
 }
 
 function _ensureDocTimeStampPerms(pdf, rootDict, docTsRef){
@@ -571,137 +460,6 @@ function _appendUniqueRef(dictStr, arrayKey, objNum){
   return _injectKeyRaw(dictStr, arrayKey + ' [ ' + ref + ' ]');
 }
 
-function _upsertKeyRaw(dictStr, key, rawValue){
-  const keyEsc = key.replace('/', '\\/');
-  const valuePattern = '(<<[\\s\\S]*?>>|\\[[\\s\\S]*?\]|\((?:[^\\\\)]|\\.)*\)|[^/<>\s][^/\s>]*)';
-  const re = new RegExp('(' + keyEsc + '\\s+)' + valuePattern);
-  if (re.test(dictStr)) {
-    return dictStr.replace(re, function(_match, prefix){
-      return prefix + rawValue;
-    });
-  }
-  return _injectKeyRaw(dictStr, key + ' ' + rawValue);
-}
-
-function _formatPdfNumber(num){
-  if (typeof num !== 'number' || !Number.isFinite(num)) return '0';
-  if (Math.abs(num) >= 1e6 || Math.abs(num) <= 1e-6) {
-    return num.toExponential(6).replace(/0+e/, 'e').replace(/\.e/, 'e');
-  }
-  const fixed = num.toFixed(6);
-  return fixed.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
-}
-
-function _setRect(dictStr, rect){
-  if (!Array.isArray(rect) || rect.length !== 4) return dictStr;
-  const rectVals = rect.map((n) => _formatPdfNumber(Number(n) || 0));
-  return _upsertKeyRaw(dictStr, '/Rect', '[ ' + rectVals.join(' ') + ' ]');
-}
-
-function _setKeyRef(dictStr, key, objNum){
-  if (typeof objNum !== 'number' || objNum < 0) return dictStr;
-  return _upsertKeyRaw(dictStr, key, objNum + ' 0 R');
-}
-
-function _extractArrayContent(dictStr, key){
-  const keyEsc = key.replace('/', '\\/');
-  const re = new RegExp(keyEsc + '\\s*\[(.*?)\]', 's');
-  const match = re.exec(dictStr);
-  if (!match) return null;
-  return match[1];
-}
-
-function _extractRefArray(dictStr, key){
-  const content = _extractArrayContent(dictStr, key);
-  if (!content) return [];
-  const refs = [];
-  const re = /(\d+)\s+0\s+R/g;
-  let m;
-  while ((m = re.exec(content)) !== null){
-    refs.push(parseInt(m[1], 10));
-  }
-  return refs;
-}
-
-function _parseRect(dictStr){
-  const match = /\/Rect\s*\[([^\]]+)\]/.exec(dictStr);
-  if (!match) return null;
-  const parts = match[1].trim().split(/\s+/).slice(0, 4);
-  if (parts.length !== 4) return null;
-  return parts.map((p) => parseFloat(p));
-}
-
-function _normalizeRect(rect){
-  if (!Array.isArray(rect) || rect.length !== 4) return rect;
-  const x1 = Number(rect[0]) || 0;
-  const y1 = Number(rect[1]) || 0;
-  const x2 = Number(rect[2]) || 0;
-  const y2 = Number(rect[3]) || 0;
-  const llx = Math.min(x1, x2);
-  const lly = Math.min(y1, y2);
-  const urx = Math.max(x1, x2);
-  const ury = Math.max(y1, y2);
-  return [llx, lly, urx, ury];
-}
-
-function _extractRef(dictStr, key){
-  const keyEsc = key.replace('/', '\\/');
-  const re = new RegExp(keyEsc + '\\s+(\d+)\\s+0\\s+R');
-  const match = re.exec(dictStr);
-  return match ? parseInt(match[1], 10) : null;
-}
-
-function _extractDictEntries(dictStr){
-  const entries = [];
-  const re = /\/([A-Za-z0-9\.\-#]+)\s+(<<[\s\S]*?>>|\[[\s\S]*?\]|\((?:[^\\)]|\\.)*\)|\/?[^\s<>]+)/g;
-  let m;
-  while ((m = re.exec(dictStr)) !== null){
-    entries.push({ key: '/' + m[1], value: m[2] });
-  }
-  return entries;
-}
-
-function _composeWidgetDict({ rect, parentObjNum, pageObjNum, extras = [], flags = 132 }){
-  const parts = ['<<', '/Type /Annot', '/Subtype /Widget', '/FT /Sig'];
-  if (Array.isArray(rect) && rect.length === 4) {
-    const normalized = _normalizeRect(rect);
-    const rectVals = normalized.map((n) => _formatPdfNumber(Number(n) || 0));
-    parts.push('/Rect [ ' + rectVals.join(' ') + ' ]');
-  }
-  if (typeof flags === 'number') {
-    parts.push('/F ' + flags);
-  }
-  if (typeof parentObjNum === 'number' && parentObjNum >= 0) {
-    parts.push('/Parent ' + parentObjNum + ' 0 R');
-  }
-  if (typeof pageObjNum === 'number' && pageObjNum >= 0) {
-    parts.push('/P ' + pageObjNum + ' 0 R');
-  }
-  extras.forEach((entry) => {
-    if (entry && entry.key && entry.value) {
-      parts.push(entry.key + ' ' + entry.value);
-    }
-  });
-  parts.push('>>');
-  return parts.join(' ');
-}
-
-function _removeRefFromArray(dictStr, arrayKey, objNum){
-  const content = _extractArrayContent(dictStr, arrayKey);
-  if (!content) return dictStr;
-  const ref = objNum + ' 0 R';
-  const refs = content.match(/\d+\s+0\s+R/g) || [];
-  const filtered = refs.filter((item) => item !== ref);
-  if (filtered.length === refs.length) return dictStr;
-  const keyEsc = arrayKey.replace('/', '\\/');
-  const re = new RegExp(keyEsc + '\\s*\[[^\]]*\]');
-  if (filtered.length === 0) {
-    return dictStr.replace(re, '');
-  }
-  const replacement = arrayKey + ' [ ' + filtered.join(' ') + ' ]';
-  return dictStr.replace(re, replacement);
-}
-
 function _ensureSigFlags(dictStr){
   if (/\/SigFlags\s+3\b/.test(dictStr)) return dictStr;
   if (/\/SigFlags\b/.test(dictStr)){
@@ -737,29 +495,630 @@ function _buildXrefSorted(newObjs){
 
 function _appendXrefTrailer(baseBuf, newObjs, opts){
   const size = opts.size, rootRef = opts.rootRef, prevXref = opts.prevXref;
-  var pos = baseBuf.length;
+  let pos = baseBuf.length;
   const chunks = [];
-  for (var i=0; i<newObjs.length; i++){
-    var o = newObjs[i];
-    o.offset = pos;
-    const header = Buffer.from(o.objNum + ' 0 obj\n', 'latin1');
-    let body;
-    if (Buffer.isBuffer(o.contentBuffer)) {
-      body = o.contentBuffer;
-    } else if (typeof o.contentStr === 'string') {
-      body = Buffer.from(o.contentStr, 'latin1');
+  for (let i = 0; i < newObjs.length; i++) {
+    const o = newObjs[i];
+    let bodyBuf;
+    if (o.stream && o.dict) {
+      let dictStr = o.dict;
+      if (!/\/Length\b/.test(dictStr)) {
+        dictStr = dictStr.replace(/>>\s*$/, ' /Length ' + o.stream.length + ' >>');
+      }
+      const header = o.objNum + ' 0 obj\n' + dictStr + '\nstream\n';
+      const footer = '\nendstream\nendobj\n';
+      bodyBuf = Buffer.concat([
+        Buffer.from(header, 'latin1'),
+        o.stream,
+        Buffer.from(footer, 'latin1')
+      ]);
     } else {
-      body = Buffer.alloc(0);
+      const content = (o.content instanceof Buffer) ? o.content
+        : Buffer.from(o.contentStr || '', 'latin1');
+      const header = o.objNum + ' 0 obj\n';
+      const footer = '\nendobj\n';
+      bodyBuf = Buffer.concat([
+        Buffer.from(header, 'latin1'),
+        content,
+        Buffer.from(footer, 'latin1')
+      ]);
     }
-    const footer = Buffer.from('\nendobj\n', 'latin1');
-    const chunk = Buffer.concat([header, body, footer]);
-    chunks.push(chunk);
-    pos += chunk.length;
+    o.offset = pos;
+    pos += bodyBuf.length;
+    chunks.push(bodyBuf);
   }
   const xrefPos = pos;
   const xref = _buildXrefSorted(newObjs);
   const trailer = 'trailer\n<< /Size ' + size + ' /Root ' + rootRef + ' /Prev ' + prevXref + ' >>\nstartxref\n' + xrefPos + '\n%%EOF\n';
   return Buffer.concat([baseBuf, Buffer.concat(chunks), Buffer.from(xref + trailer, 'latin1')]);
+}
+
+function _formatPdfNumber(value){
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error('PDF number must be finite');
+  }
+  const rounded = Math.round(value * 1000) / 1000;
+  let str = String(rounded);
+  if (/[eE]/.test(str)) {
+    str = rounded.toFixed(6);
+  }
+  if (str.indexOf('.') >= 0) {
+    str = str.replace(/0+$/, '');
+    if (str.endsWith('.')) str = str.slice(0, -1);
+  }
+  if (str === '') str = '0';
+  return str;
+}
+
+const VISIBLE_FONT_INFO = (() => {
+  let cache = null;
+  return {
+    get(){
+      if (cache) return cache;
+      cache = _getHelveticaMetrics();
+      return cache;
+    }
+  };
+})();
+
+function _measureVisibleFontTextWidth(text, fontSize){
+  if (!text || fontSize <= 0) return 0;
+  const metrics = VISIBLE_FONT_INFO.get();
+  const normalized = typeof text === 'string' ? text.normalize('NFC') : '';
+  if (!normalized) return 0;
+  let total = 0;
+  for (const ch of normalized) {
+    total += metrics.widthForChar(ch);
+  }
+  return (total / metrics.unitsPerEm) * fontSize;
+}
+
+const TURKISH_PDF_GLYPH_CODE_MAP = {
+  'Ğ': 0xD0,
+  'İ': 0xDD,
+  'Ş': 0xDE,
+  'ğ': 0xF0,
+  'ı': 0xFD,
+  'ş': 0xFE
+};
+
+const HELVETICA_WIDTH_TABLE = Object.freeze({
+  ' ': 278,
+  '!': 278,
+  '"': 355,
+  '#': 556,
+  '$': 556,
+  '%': 889,
+  '&': 667,
+  "'": 191,
+  '(': 333,
+  ')': 333,
+  '*': 389,
+  '+': 584,
+  ',': 278,
+  '-': 333,
+  '.': 278,
+  '/': 278,
+  '0': 556,
+  '1': 556,
+  '2': 556,
+  '3': 556,
+  '4': 556,
+  '5': 556,
+  '6': 556,
+  '7': 556,
+  '8': 556,
+  '9': 556,
+  ':': 278,
+  ';': 278,
+  '<': 584,
+  '=': 584,
+  '>': 584,
+  '?': 556,
+  '@': 1015,
+  'A': 667,
+  'B': 667,
+  'C': 722,
+  'D': 722,
+  'E': 667,
+  'F': 611,
+  'G': 778,
+  'H': 722,
+  'I': 278,
+  'J': 556,
+  'K': 667,
+  'L': 556,
+  'M': 833,
+  'N': 722,
+  'O': 778,
+  'P': 667,
+  'Q': 778,
+  'R': 722,
+  'S': 667,
+  'T': 611,
+  'U': 722,
+  'V': 667,
+  'W': 944,
+  'X': 667,
+  'Y': 667,
+  'Z': 611,
+  '[': 278,
+  '\\': 278,
+  ']': 278,
+  '^': 469,
+  '_': 556,
+  '`': 333,
+  'a': 556,
+  'b': 556,
+  'c': 500,
+  'd': 556,
+  'e': 556,
+  'f': 278,
+  'g': 556,
+  'h': 556,
+  'i': 222,
+  'j': 222,
+  'k': 500,
+  'l': 222,
+  'm': 833,
+  'n': 556,
+  'o': 556,
+  'p': 556,
+  'q': 556,
+  'r': 333,
+  's': 500,
+  't': 278,
+  'u': 556,
+  'v': 500,
+  'w': 722,
+  'x': 500,
+  'y': 500,
+  'z': 500,
+  '{': 334,
+  '|': 260,
+  '}': 334,
+  '~': 584,
+  'Ç': 722,
+  'Ö': 778,
+  'Ü': 722,
+  'ç': 500,
+  'ö': 556,
+  'ü': 556,
+  'Ğ': 778,
+  'ğ': 556,
+  'İ': 278,
+  'ı': 222,
+  'Ş': 667,
+  'ş': 500
+});
+
+const HELVETICA_FALLBACKS = Object.freeze({
+  'Â': 'A',
+  'Ä': 'A',
+  'À': 'A',
+  'Á': 'A',
+  'Ã': 'A',
+  'Å': 'A',
+  'Æ': 'A',
+  'ç': 'ç',
+  'É': 'E',
+  'Ê': 'E',
+  'È': 'E',
+  'Ë': 'E',
+  'Î': 'I',
+  'Ï': 'I',
+  'Ó': 'O',
+  'Ô': 'O',
+  'Ò': 'O',
+  'Õ': 'O',
+  'Û': 'U',
+  'Ù': 'U',
+  'Ý': 'Y',
+  'á': 'a',
+  'â': 'a',
+  'ä': 'a',
+  'à': 'a',
+  'ã': 'a',
+  'å': 'a',
+  'æ': 'a',
+  'é': 'e',
+  'ê': 'e',
+  'è': 'e',
+  'ë': 'e',
+  'î': 'i',
+  'ï': 'i',
+  'ñ': 'n',
+  'ó': 'o',
+  'ô': 'o',
+  'ò': 'o',
+  'õ': 'o',
+  'ú': 'u',
+  'û': 'u',
+  'ù': 'u',
+  'ý': 'y',
+  'ÿ': 'y'
+});
+
+function _getHelveticaMetrics(){
+  const defaultWidth = HELVETICA_WIDTH_TABLE['?'];
+  return {
+    unitsPerEm: 1000,
+    widthForChar(ch){
+      if (!ch) return defaultWidth;
+      const direct = HELVETICA_WIDTH_TABLE[ch];
+      if (typeof direct === 'number') return direct;
+      const fallbackKey = HELVETICA_FALLBACKS[ch];
+      if (fallbackKey) {
+        const mapped = HELVETICA_WIDTH_TABLE[fallbackKey];
+        if (typeof mapped === 'number') return mapped;
+      }
+      const codePoint = ch.codePointAt(0);
+      if (codePoint >= 0x20 && codePoint <= 0x7E) {
+        const asciiChar = String.fromCharCode(codePoint);
+        if (typeof HELVETICA_WIDTH_TABLE[asciiChar] === 'number') {
+          return HELVETICA_WIDTH_TABLE[asciiChar];
+        }
+      }
+      return defaultWidth;
+    }
+  };
+}
+
+const WIN_ANSI_CHAR_TO_BYTE = (() => {
+  const map = new Map();
+  for (let i = 0x20; i <= 0x7E; i++) {
+    map.set(String.fromCharCode(i), i);
+  }
+  const extras = {
+    '€': 0x80,
+    '‚': 0x82,
+    'ƒ': 0x83,
+    '„': 0x84,
+    '…': 0x85,
+    '†': 0x86,
+    '‡': 0x87,
+    'ˆ': 0x88,
+    '‰': 0x89,
+    'Š': 0x8A,
+    '‹': 0x8B,
+    'Œ': 0x8C,
+    'Ž': 0x8E,
+    '‘': 0x91,
+    '’': 0x92,
+    '“': 0x93,
+    '”': 0x94,
+    '•': 0x95,
+    '–': 0x96,
+    '—': 0x97,
+    '˜': 0x98,
+    '™': 0x99,
+    'š': 0x9A,
+    '›': 0x9B,
+    'œ': 0x9C,
+    'ž': 0x9E,
+    'Ÿ': 0x9F,
+    ' ': 0xA0,
+    '¡': 0xA1,
+    '¢': 0xA2,
+    '£': 0xA3,
+    '¤': 0xA4,
+    '¥': 0xA5,
+    '¦': 0xA6,
+    '§': 0xA7,
+    '¨': 0xA8,
+    '©': 0xA9,
+    'ª': 0xAA,
+    '«': 0xAB,
+    '¬': 0xAC,
+    '®': 0xAE,
+    '¯': 0xAF,
+    '°': 0xB0,
+    '±': 0xB1,
+    '²': 0xB2,
+    '³': 0xB3,
+    '´': 0xB4,
+    'µ': 0xB5,
+    '¶': 0xB6,
+    '·': 0xB7,
+    '¸': 0xB8,
+    '¹': 0xB9,
+    'º': 0xBA,
+    '»': 0xBB,
+    '¼': 0xBC,
+    '½': 0xBD,
+    '¾': 0xBE,
+    '¿': 0xBF,
+    'À': 0xC0,
+    'Á': 0xC1,
+    'Â': 0xC2,
+    'Ã': 0xC3,
+    'Ä': 0xC4,
+    'Å': 0xC5,
+    'Æ': 0xC6,
+    'Ç': 0xC7,
+    'È': 0xC8,
+    'É': 0xC9,
+    'Ê': 0xCA,
+    'Ë': 0xCB,
+    'Ì': 0xCC,
+    'Í': 0xCD,
+    'Î': 0xCE,
+    'Ï': 0xCF,
+    'Ð': 0xD0,
+    'Ñ': 0xD1,
+    'Ò': 0xD2,
+    'Ó': 0xD3,
+    'Ô': 0xD4,
+    'Õ': 0xD5,
+    'Ö': 0xD6,
+    '×': 0xD7,
+    'Ø': 0xD8,
+    'Ù': 0xD9,
+    'Ú': 0xDA,
+    'Û': 0xDB,
+    'Ü': 0xDC,
+    'Ý': 0xDD,
+    'Þ': 0xDE,
+    'ß': 0xDF,
+    'à': 0xE0,
+    'á': 0xE1,
+    'â': 0xE2,
+    'ã': 0xE3,
+    'ä': 0xE4,
+    'å': 0xE5,
+    'æ': 0xE6,
+    'ç': 0xE7,
+    'è': 0xE8,
+    'é': 0xE9,
+    'ê': 0xEA,
+    'ë': 0xEB,
+    'ì': 0xEC,
+    'í': 0xED,
+    'î': 0xEE,
+    'ï': 0xEF,
+    'ð': 0xF0,
+    'ñ': 0xF1,
+    'ò': 0xF2,
+    'ó': 0xF3,
+    'ô': 0xF4,
+    'õ': 0xF5,
+    'ö': 0xF6,
+    '÷': 0xF7,
+    'ø': 0xF8,
+    'ù': 0xF9,
+    'ú': 0xFA,
+    'û': 0xFB,
+    'ü': 0xFC,
+    'ý': 0xFD,
+    'þ': 0xFE,
+    'ÿ': 0xFF
+  };
+  Object.entries(extras).forEach(([ch, code]) => map.set(ch, code));
+  Object.entries(TURKISH_PDF_GLYPH_CODE_MAP).forEach(([ch, code]) => map.set(ch, code));
+  map.set('\n', 0x0A);
+  map.set('\r', 0x0D);
+  return map;
+})();
+
+function _encodeWinAnsiString(text){
+  const normalized = typeof text === 'string' ? text.normalize('NFC') : '';
+  const bytes = [];
+  const fallback = 0x3F; // '?'
+  for (const ch of normalized) {
+    const mapped = WIN_ANSI_CHAR_TO_BYTE.get(ch);
+    if (mapped != null) {
+      bytes.push(mapped);
+      continue;
+    }
+    const codePoint = ch.codePointAt(0);
+    if (codePoint >= 0 && codePoint <= 0xFF) {
+      bytes.push(codePoint);
+    } else {
+      bytes.push(fallback);
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function _pdfStringLiteralFromBuffer(buffer){
+  let out = '';
+  for (const byte of buffer) {
+    if (byte === 0x28 || byte === 0x29 || byte === 0x5C) {
+      out += '\\' + String.fromCharCode(byte);
+    } else if (byte < 0x20 || byte > 0x7E) {
+      const octal = byte.toString(8).padStart(3, '0');
+      out += '\\' + octal;
+    } else {
+      out += String.fromCharCode(byte);
+    }
+  }
+  return '(' + out + ')';
+}
+
+function _forceBreakWord(word, fontSize, maxWidth){
+  if (!word) return [];
+  const chars = Array.from(word);
+  const lines = [];
+  let current = '';
+  const tolerance = Math.max(0.01, maxWidth * 0.01);
+  chars.forEach((char) => {
+    const candidate = current + char;
+    if (!current) {
+      current = char;
+      return;
+    }
+    const width = _measureVisibleFontTextWidth(candidate, fontSize);
+    if (width <= maxWidth + tolerance || _measureVisibleFontTextWidth(current, fontSize) <= tolerance) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = char;
+    }
+  });
+  if (current) lines.push(current);
+  return lines;
+}
+
+function _wrapTextLine(line, fontSize, maxWidth){
+  const words = line.split(/\s+/).filter((word) => word.length > 0);
+  if (!words.length) return [];
+  const lines = [];
+  const tolerance = Math.max(0.01, maxWidth * 0.01);
+  let current = '';
+
+  const pushCurrent = () => {
+    if (!current) return;
+    if (_measureVisibleFontTextWidth(current, fontSize) > maxWidth + tolerance) {
+      const forced = _forceBreakWord(current, fontSize, maxWidth);
+      forced.forEach((segment) => {
+        if (segment) lines.push(segment);
+      });
+    } else {
+      lines.push(current);
+    }
+    current = '';
+  };
+
+  words.forEach((word) => {
+    if (!current) {
+      if (_measureVisibleFontTextWidth(word, fontSize) <= maxWidth + tolerance) {
+        current = word;
+      } else {
+        const forced = _forceBreakWord(word, fontSize, maxWidth);
+        forced.forEach((segment) => {
+          if (segment) lines.push(segment);
+        });
+      }
+      return;
+    }
+    const candidate = current + ' ' + word;
+    if (_measureVisibleFontTextWidth(candidate, fontSize) <= maxWidth + tolerance) {
+      current = candidate;
+      return;
+    }
+    pushCurrent();
+    if (_measureVisibleFontTextWidth(word, fontSize) <= maxWidth + tolerance) {
+      current = word;
+    } else {
+      const forced = _forceBreakWord(word, fontSize, maxWidth);
+      forced.forEach((segment) => {
+        if (segment) lines.push(segment);
+      });
+    }
+  });
+
+  pushCurrent();
+  return lines;
+}
+
+function _layoutTextBlock(lines, availableWidth, opts){
+  const sanitized = Array.isArray(lines)
+    ? lines.filter((line) => typeof line === 'string' && line.trim().length > 0)
+    : [];
+  if (!sanitized.length || availableWidth <= 0 || opts.fontSize <= 0) {
+    return { lines: [], fontSize: 0, lineHeight: 0, blockHeight: 0 };
+  }
+
+  const minFont = Math.max(4, Math.min(opts.fontSize, opts.minFontSize || 8));
+  const step = opts.fontStep && opts.fontStep > 0 ? opts.fontStep : 0.5;
+  const width = Math.max(availableWidth, 1);
+  const ratio = opts.fontSize > 0 ? opts.lineHeight / opts.fontSize : 1.2;
+
+  let size = opts.fontSize;
+  let best = null;
+  while (size + 1e-6 >= minFont) {
+    const wrapped = [];
+    sanitized.forEach((line) => {
+      const segments = _wrapTextLine(line, size, width);
+      if (segments.length === 0) return;
+      segments.forEach((segment) => wrapped.push(segment));
+    });
+
+    const tooWide = wrapped.some((line) => _measureVisibleFontTextWidth(line, size) > width + Math.max(0.01, width * 0.01));
+    const lineHeight = Math.max(size * 1.05, ratio * size);
+    const blockHeight = wrapped.length
+      ? opts.padding.top + opts.padding.bottom + size + (wrapped.length - 1) * lineHeight
+      : 0;
+    best = { lines: wrapped, fontSize: size, lineHeight, blockHeight };
+    if (!tooWide) {
+      return best;
+    }
+    if (size === minFont) break;
+    size = Math.max(minFont, size - step);
+  }
+
+  if (best) return best;
+  return { lines: [], fontSize: 0, lineHeight: 0, blockHeight: 0 };
+}
+
+function _encodePdfDocBytes(text){
+  const bytes = [];
+  const pushByte = (byte) => {
+    bytes.push(byte & 0xFF);
+  };
+
+  const encodeChar = (char) => {
+    if (!char) return;
+    if (Object.prototype.hasOwnProperty.call(TURKISH_PDF_GLYPH_CODE_MAP, char)) {
+      pushByte(TURKISH_PDF_GLYPH_CODE_MAP[char]);
+      return;
+    }
+    const codePoint = char.codePointAt(0);
+    if (codePoint <= 0xFF) {
+      pushByte(codePoint);
+      return;
+    }
+    const decomposed = char.normalize('NFD');
+    if (decomposed && decomposed !== char) {
+      for (const subChar of decomposed) {
+        encodeChar(subChar);
+      }
+      return;
+    }
+    pushByte(0x3F);
+  };
+
+  const normalized = typeof text === 'string' ? text.normalize('NFC') : '';
+  for (const char of normalized) {
+    encodeChar(char);
+  }
+  return bytes;
+}
+
+function _pdfStringLiteral(value){
+  const bytes = _encodePdfDocBytes(value);
+  let body = '';
+  for (const byte of bytes) {
+    if (byte === 0x28) { // (
+      body += '\\(';
+    } else if (byte === 0x29) { // )
+      body += '\\)';
+    } else if (byte === 0x5C) { // \
+      body += '\\\\';
+    } else if (byte < 0x20 || byte > 0x7E) {
+      body += '\\' + byte.toString(8).padStart(3, '0');
+    } else {
+      body += String.fromCharCode(byte);
+    }
+  }
+  return '(' + body + ')';
+}
+
+function _setRect(dictStr, coords){
+  const formatted = coords.map(_formatPdfNumber);
+  const rectStr = '/Rect [ ' + formatted.join(' ') + ' ]';
+  if (/\/Rect\s*\[[^\]]*\]/.test(dictStr)) {
+    return dictStr.replace(/\/Rect\s*\[[^\]]*\]/, rectStr);
+  }
+  return dictStr.replace(/>>\s*$/, ' ' + rectStr + ' >>');
+}
+
+function _setAppearance(dictStr, appearanceRef){
+  const appStr = '/AP << /N ' + appearanceRef + ' >>';
+  if (/\/AP\s*<<[\s\S]*?>>/.test(dictStr)) {
+    return dictStr.replace(/\/AP\s*<<[\s\S]*?>>/, appStr);
+  }
+  return dictStr.replace(/>>\s*$/, ' ' + appStr + ' >>');
 }
 
 /**
@@ -769,14 +1128,9 @@ function _appendXrefTrailer(baseBuf, newObjs, opts){
  *  - Boş /Sig field + görünmez Widget (/Parent=field, /P=page),
  *  - 1. sayfanın /Annots’una widget referansı eklenir (gerçek /Page objesi!).
  */
-function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
-  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
-  const opts = options || {};
+function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName){
   const requestedName = (typeof fieldName === 'string' && fieldName.length > 0) ? fieldName : null;
   const fieldLabel = requestedName || 'Sig1';
-  const requestedRect = Array.isArray(opts.rect) && opts.rect.length === 4 ? opts.rect.map((v) => Number(v) || 0) : null;
-  const hasPageIndex = typeof opts.pageIndex === 'number' && opts.pageIndex >= 0;
-  const requestedPageIndex = hasPageIndex ? Math.floor(opts.pageIndex) : null;
 
   const meta = readLastTrailer(pdfBuffer);
   const root = readObject(pdfBuffer, meta.rootObjNum);
@@ -785,7 +1139,7 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
   const acroInfo = locateAcroForm(pdfBuffer, meta.rootObjNum);
   const existingField = findEmptySignatureField(pdfBuffer, meta.rootObjNum, requestedName);
 
-  const updates = new Map();
+  const newObjs = [];
   let nextObj = meta.size;
 
   let acroObjNum;
@@ -823,40 +1177,11 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
 
   let fieldObjNum;
   let widgetObjNum = null;
-  let widgetDictStr = null;
-  let fieldDictStr = null;
   let pageObjNum = null;
-  let originalWidgetPage = null;
 
   if (existingField) {
     fieldObjNum = existingField.objNum;
-    fieldDictStr = existingField.dictStr;
-    const kids = _extractRefArray(fieldDictStr, '/Kids');
-    if (kids.length > 0) {
-      widgetObjNum = kids[0];
-      const widgetObj = readObject(pdfBuffer, widgetObjNum);
-      if (widgetObj && widgetObj.dictStr) {
-        widgetDictStr = widgetObj.dictStr;
-        const pageMatch = /\/P\s+(\d+)\s+0\s+R/.exec(widgetDictStr);
-        if (pageMatch) {
-          originalWidgetPage = parseInt(pageMatch[1], 10);
-          if (Number.isInteger(originalWidgetPage)) {
-            pageObjNum = originalWidgetPage;
-          }
-        }
-      }
-    }
-    if (!widgetObjNum) {
-      widgetObjNum = nextObj++;
-      widgetDictStr = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R >>';
-      updates.set(widgetObjNum, { contentStr: widgetDictStr });
-      const updatedFieldDict = _appendUniqueRef(fieldDictStr || '<<>>', '/Kids', widgetObjNum);
-      if (updatedFieldDict !== fieldDictStr) {
-        fieldDictStr = updatedFieldDict;
-        updates.set(fieldObjNum, { contentStr: fieldDictStr });
-      }
-    }
-    const updatedAcro = _appendUniqueRef(acroDict || '<<>>', '/Fields', fieldObjNum);
+    const updatedAcro = _appendUniqueRef(acroDict, '/Fields', fieldObjNum);
     if (updatedAcro !== acroDict) {
       acroDict = updatedAcro;
       acroChanged = true;
@@ -864,11 +1189,9 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
   } else {
     fieldObjNum = nextObj++;
     widgetObjNum = nextObj++;
-    fieldDictStr = '<< /FT /Sig /T (' + fieldLabel + ') /Ff 0 /Kids [ ' + widgetObjNum + ' 0 R ] >>';
-    updates.set(fieldObjNum, { contentStr: fieldDictStr });
 
     try {
-      pageObjNum = hasPageIndex ? findPageObjNumByIndex(pdfBuffer, requestedPageIndex) : findFirstPageObjNumSafe(pdfBuffer);
+      pageObjNum = findFirstPageObjNumSafe(pdfBuffer);
     } catch (err) {
       pageObjNum = _findFirstPageByScan(pdfBuffer);
       if (!pageObjNum) throw err;
@@ -878,13 +1201,17 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
       throw new Error('Resolved page is not /Type /Page');
     }
 
-    widgetDictStr = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R /P ' + pageObjNum + ' 0 R >>';
-    updates.set(widgetObjNum, { contentStr: widgetDictStr });
+    const fieldDict = '<< /FT /Sig /T (' + fieldLabel + ') /Ff 0 /Kids [ ' + widgetObjNum + ' 0 R ] >>';
+    const widgetDict = '<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /Parent ' + fieldObjNum + ' 0 R /P ' + pageObjNum + ' 0 R >>';
+
+    newObjs.push({ objNum: fieldObjNum, contentStr: fieldDict });
+    newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
 
     let pageDict = pageObj.dictStr;
-    const updatedPage = _appendUniqueRef(pageDict || '<<>>', '/Annots', widgetObjNum);
+    const updatedPage = _appendUniqueRef(pageDict, '/Annots', widgetObjNum);
     if (updatedPage !== pageDict) {
-      updates.set(pageObjNum, { contentStr: updatedPage });
+      pageDict = updatedPage;
+      newObjs.push({ objNum: pageObjNum, contentStr: pageDict });
     }
 
     const updatedAcro = _appendUniqueRef(acroDict || '<<>>', '/Fields', fieldObjNum);
@@ -894,133 +1221,29 @@ function ensureAcroFormAndEmptySigField(pdfBuffer, fieldName, options){
     }
   }
 
-  if (!widgetDictStr) {
-    const widgetObj = readObject(pdfBuffer, widgetObjNum);
-    widgetDictStr = widgetObj && widgetObj.dictStr ? widgetObj.dictStr : '<<>>';
-  }
-
-  const resolvePageObj = () => {
-    if (typeof pageObjNum === 'number' && pageObjNum >= 0) return pageObjNum;
-    if (hasPageIndex) {
-      try {
-        pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
-        return pageObjNum;
-      } catch (_err) {
-        // fallthrough
-      }
-    }
-    if (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0) {
-      pageObjNum = originalWidgetPage;
-      return pageObjNum;
-    }
-    try {
-      pageObjNum = findFirstPageObjNumSafe(pdfBuffer);
-      return pageObjNum;
-    } catch (_err) {
-      pageObjNum = _findFirstPageByScan(pdfBuffer);
-      return pageObjNum;
-    }
-  };
-
-  const finalPageObj = resolvePageObj();
-
-  let appliedRect = null;
-  if (requestedRect) {
-    appliedRect = _normalizeRect(requestedRect);
-  } else {
-    const existingRect = _parseRect(widgetDictStr);
-    if (existingRect) appliedRect = _normalizeRect(existingRect);
-  }
-
-  const parentObjNum = (() => {
-    const existingParent = _extractRef(widgetDictStr, '/Parent');
-    if (typeof existingParent === 'number' && existingParent >= 0) return existingParent;
-    return fieldObjNum;
-  })();
-
-  const extras = _extractDictEntries(widgetDictStr || '<<>>').filter((entry) => {
-    const key = entry.key;
-    return !['/Type', '/Subtype', '/FT', '/Rect', '/F', '/Parent', '/P'].includes(key);
-  });
-
-  const targetPageObjNum = (typeof finalPageObj === 'number' && finalPageObj >= 0)
-    ? finalPageObj
-    : (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0 ? originalWidgetPage : null);
-
-  widgetDictStr = _composeWidgetDict({
-    rect: Array.isArray(appliedRect) ? appliedRect : null,
-    parentObjNum,
-    pageObjNum: targetPageObjNum,
-    extras
-  });
-  updates.set(widgetObjNum, { contentStr: widgetDictStr });
-
-  if (typeof targetPageObjNum === 'number' && targetPageObjNum >= 0) {
-    const pageObj = readObject(pdfBuffer, targetPageObjNum);
-    if (pageObj && pageObj.dictStr) {
-      let pageDict = pageObj.dictStr;
-      const pageWithAnnot = _appendUniqueRef(pageDict, '/Annots', widgetObjNum);
-      if (pageWithAnnot !== pageDict) {
-        pageDict = pageWithAnnot;
-        updates.set(targetPageObjNum, { contentStr: pageDict });
-      }
-    }
-    if (typeof originalWidgetPage === 'number' && originalWidgetPage >= 0 && originalWidgetPage !== targetPageObjNum) {
-      const oldPageObj = readObject(pdfBuffer, originalWidgetPage);
-      if (oldPageObj && oldPageObj.dictStr) {
-        const cleaned = _removeRefFromArray(oldPageObj.dictStr, '/Annots', widgetObjNum);
-        if (cleaned !== oldPageObj.dictStr) {
-          updates.set(originalWidgetPage, { contentStr: cleaned });
-        }
-      }
-    }
-  }
-
-  if (acroChanged && typeof acroObjNum === 'number') {
-    updates.set(acroObjNum, { contentStr: acroDict });
+  if (acroChanged) {
+    newObjs.push({ objNum: acroObjNum, contentStr: acroDict });
   }
   if (rootChanged) {
-    updates.set(meta.rootObjNum, { contentStr: rootDict });
+    newObjs.push({ objNum: meta.rootObjNum, contentStr: rootDict });
   }
 
-  if (updates.size === 0) {
-    const rectOut = Array.isArray(appliedRect)
-      ? appliedRect
-      : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
-    return {
-      pdf: pdfBuffer,
-      fieldObjNum,
-      widgetObjNum,
-      pageObjNum: typeof targetPageObjNum === 'number' ? targetPageObjNum : (typeof originalWidgetPage === 'number' ? originalWidgetPage : null),
-      rect: rectOut
-    };
+  if (newObjs.length === 0) {
+    return pdfBuffer;
   }
 
-  const newObjs = [];
-  updates.forEach((value, key) => {
-    newObjs.push({ objNum: key, ...value });
-  });
   const maxObjNum = newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity);
   const newSize = Math.max(meta.size, maxObjNum + 1);
-  const updatedPdf = _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
-  const rectOut = Array.isArray(appliedRect)
-    ? appliedRect
-    : (_normalizeRect(_parseRect(widgetDictStr)) || [0, 0, 0, 0]);
 
-  return {
-    pdf: updatedPdf,
-    fieldObjNum,
-    widgetObjNum,
-    pageObjNum: typeof targetPageObjNum === 'number' ? targetPageObjNum : (typeof originalWidgetPage === 'number' ? originalWidgetPage : null),
-    rect: rectOut
-  };
+  return _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
 }
 
 /* --------------------------- İmza yerleştirici sınıfı --------------------------- */
 
 class PDFPAdESWriter {
   constructor(pdfBuffer){
-    this.pdf = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
+    if (!Buffer.isBuffer(pdfBuffer)) throw new Error('pdfBuffer must be Buffer');
+    this.pdf = pdfBuffer;
     const meta = readLastTrailer(this.pdf);
     this.rootRef = meta.rootRef;
     this.rootObjNum = meta.rootObjNum;
@@ -1046,9 +1269,6 @@ class PDFPAdESWriter {
       placeholderHexLen += 1;
     }
     var fieldName = opts.fieldName || null;
-    const signerName = typeof opts.signerName === 'string' ? opts.signerName : null;
-    const reason = typeof opts.reason === 'string' ? opts.reason : null;
-    const contactInfo = typeof opts.contactInfo === 'string' ? opts.contactInfo : null;
 
     const acro = locateAcroForm(this.pdf, this.rootObjNum);
     if (!acro) throw new Error('/AcroForm not found. Provide at least one empty /Sig field.');
@@ -1088,11 +1308,23 @@ class PDFPAdESWriter {
     const BR = '0000000000 0000000000 0000000000 0000000000';
 
     const pPart = pageRefStr ? (' /P ' + pageRefStr) : '';
-    const namePart = signerName ? (' /Name (' + _escapePdfString(signerName) + ')') : '';
-    const reasonPart = reason ? (' /Reason (' + _escapePdfString(reason) + ')') : '';
-    const contactPart = contactInfo ? (' /ContactInfo (' + _escapePdfString(contactInfo) + ')') : '';
-    const sigDict = '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /' + subFilter + pPart + namePart + reasonPart + contactPart +
-                    ' /ByteRange [' + BR + '] /Contents <' + placeholderHex + '> /M (' + dateStr + ') >>';
+    const extraEntries = [];
+    if (typeof opts.signerName === 'string' && opts.signerName.length > 0) {
+      extraEntries.push('/Name ' + _pdfStringLiteral(opts.signerName));
+    }
+    if (typeof opts.reason === 'string' && opts.reason.length > 0) {
+      extraEntries.push('/Reason ' + _pdfStringLiteral(opts.reason));
+    }
+    if (typeof opts.location === 'string' && opts.location.length > 0) {
+      extraEntries.push('/Location ' + _pdfStringLiteral(opts.location));
+    }
+    if (typeof opts.contactInfo === 'string' && opts.contactInfo.length > 0) {
+      extraEntries.push('/ContactInfo ' + _pdfStringLiteral(opts.contactInfo));
+    }
+
+    const sigDict = '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /' + subFilter + pPart +
+                    ' /ByteRange [' + BR + '] /Contents <' + placeholderHex + '> /M (' + dateStr + ')' +
+                    (extraEntries.length ? ' ' + extraEntries.join(' ') : '') + ' >>';
 
     const fieldOrig = readObject(this.pdf, fieldObjNum);
     const newFieldDictStr = this._injectV(fieldOrig.dictStr, sigObjNum + ' 0 R');
@@ -1165,7 +1397,8 @@ class PDFPAdESWriter {
       lessThanPos: lessThanPos,
       greaterThanPos: greaterThanPos,
       afterStart: afterStart,
-      placeholderHexLen: placeholderHexLen
+      placeholderHexLen: placeholderHexLen,
+      brNumsStart: brNumsStart
     };
     return {
       sigObjNum: sigObjNum,
@@ -1265,7 +1498,8 @@ class PDFPAdESWriter {
       lessThanPos: lessThanPos,
       greaterThanPos: greaterThanPos,
       afterStart: afterStart,
-      placeholderHexLen: placeholderHexLen
+      placeholderHexLen: placeholderHexLen,
+      brNumsStart: brNumsStart
     };
     return {
       sigObjNum: docTsObjNum,
@@ -1279,6 +1513,7 @@ class PDFPAdESWriter {
   computeByteRangeHash(algo){
     if (!algo) algo = 'sha256';
     if (!this._ph) throw new Error('call preparePlaceholder() first');
+    this._refreshByteRange();
     const h = crypto.createHash(algo);
     const a = 0;
     const b = this._ph.lessThanPos;
@@ -1287,6 +1522,265 @@ class PDFPAdESWriter {
     h.update(this.pdf.slice(a, a + b));
     h.update(this.pdf.slice(c, c + d));
     return h.digest();
+  }
+
+  applyVisibleSignatureFromPng(opts){
+    if (!opts || typeof opts !== 'object') {
+      throw new Error('visible signature options are required');
+    }
+    if (!this._ph || !this._ph.fieldObjNum) {
+      throw new Error('preparePlaceholder() must be called before applying appearance');
+    }
+    if (!opts.imageBuffer) {
+      throw new Error('visible signature requires imageBuffer');
+    }
+
+    const pngInfo = parsePng(opts.imageBuffer);
+    const maintainAspect = opts.maintainAspectRatio !== false;
+    const rectOpts = opts.rect || {};
+    const x = (typeof rectOpts.x === 'number') ? rectOpts.x : 0;
+    const y = (typeof rectOpts.y === 'number') ? rectOpts.y : 0;
+    let rectWidth = (typeof rectOpts.width === 'number') ? rectOpts.width : null;
+    let rectHeightInput = (typeof rectOpts.height === 'number') ? rectOpts.height : null;
+    const ratio = pngInfo.width / pngInfo.height;
+
+    const textLines = Array.isArray(opts.textLines)
+      ? opts.textLines.filter((line) => typeof line === 'string' && line.length > 0)
+      : (typeof opts.text === 'string' && opts.text.length > 0 ? [opts.text] : []);
+    const initialFontSize = (typeof opts.textFontSize === 'number' && opts.textFontSize > 0) ? opts.textFontSize : 10;
+    const baseLineHeight = (typeof opts.textLineHeight === 'number' && opts.textLineHeight > 0)
+      ? opts.textLineHeight
+      : initialFontSize * 1.2;
+    const textPadding = {
+      left: (opts.textPadding && typeof opts.textPadding.left === 'number') ? opts.textPadding.left : 4,
+      right: (opts.textPadding && typeof opts.textPadding.right === 'number') ? opts.textPadding.right : 4,
+      top: (opts.textPadding && typeof opts.textPadding.top === 'number') ? opts.textPadding.top : 2,
+      bottom: (opts.textPadding && typeof opts.textPadding.bottom === 'number') ? opts.textPadding.bottom : 2
+    };
+    const textPosition = opts.textPosition === 'top' ? 'top' : 'bottom';
+    const minFontSizeOpt = (typeof opts.textMinFontSize === 'number' && opts.textMinFontSize > 0)
+      ? Math.min(initialFontSize, opts.textMinFontSize)
+      : Math.min(initialFontSize, 8);
+    const fontStep = (typeof opts.textFontStep === 'number' && opts.textFontStep > 0)
+      ? opts.textFontStep
+      : 0.5;
+
+    let resolvedWidth = (typeof rectWidth === 'number' && rectWidth > 0) ? rectWidth : null;
+    const explicitWidth = resolvedWidth != null;
+    if (!explicitWidth && !maintainAspect) {
+      throw new Error('width must be provided when maintainAspectRatio=false');
+    }
+    if (!explicitWidth) {
+      resolvedWidth = pngInfo.width;
+    }
+
+    const layoutOpts = {
+      fontSize: initialFontSize,
+      lineHeight: baseLineHeight,
+      minFontSize: minFontSizeOpt,
+      fontStep,
+      padding: textPadding
+    };
+
+    let layout = _layoutTextBlock(textLines, Math.max(resolvedWidth - textPadding.left - textPadding.right, 1), layoutOpts);
+    let textBlockHeight = layout.blockHeight;
+    let imageHeight = null;
+    let iteration = 0;
+    const maxIterations = 4;
+    while (iteration < maxIterations) {
+      iteration++;
+      if (rectHeightInput != null) {
+        imageHeight = rectHeightInput - textBlockHeight;
+        if (imageHeight <= 0) {
+          throw new Error('Not enough height for image after reserving text area');
+        }
+      } else if (maintainAspect) {
+        imageHeight = resolvedWidth / ratio;
+      } else {
+        throw new Error('height must be provided when maintainAspectRatio=false');
+      }
+
+      if (!maintainAspect) {
+        break;
+      }
+
+      const newWidth = imageHeight * ratio;
+      const widthChanged = Math.abs(newWidth - resolvedWidth) > 0.01 && !explicitWidth;
+      if (widthChanged) {
+        resolvedWidth = newWidth;
+        layout = _layoutTextBlock(textLines, Math.max(resolvedWidth - textPadding.left - textPadding.right, 1), layoutOpts);
+        const newBlockHeight = layout.blockHeight;
+        if (Math.abs(newBlockHeight - textBlockHeight) > 0.01) {
+          textBlockHeight = newBlockHeight;
+          continue;
+        }
+      }
+
+      if (explicitWidth) {
+        const aspectHeight = resolvedWidth / ratio;
+        if (rectHeightInput == null) {
+          imageHeight = aspectHeight;
+          break;
+        }
+        const availableImageHeight = rectHeightInput - textBlockHeight;
+        if (availableImageHeight <= 0) {
+          throw new Error('Not enough height for image after reserving text area');
+        }
+        if (availableImageHeight < aspectHeight - 0.01) {
+          imageHeight = availableImageHeight;
+          const adjustedWidth = imageHeight * ratio;
+          if (Math.abs(adjustedWidth - resolvedWidth) > 0.01) {
+            resolvedWidth = adjustedWidth;
+            layout = _layoutTextBlock(textLines, Math.max(resolvedWidth - textPadding.left - textPadding.right, 1), layoutOpts);
+            textBlockHeight = layout.blockHeight;
+            continue;
+          }
+        } else {
+          imageHeight = aspectHeight;
+        }
+      }
+      break;
+    }
+
+    if (imageHeight == null) {
+      throw new Error('Unable to resolve visible signature dimensions');
+    }
+
+    const rectWidthFinal = resolvedWidth;
+    textBlockHeight = layout.blockHeight;
+    const rectHeightFinal = imageHeight + textBlockHeight;
+    const hasText = layout.lines.length > 0 && layout.fontSize > 0;
+
+    const x2 = x + rectWidthFinal;
+    const y2 = y + rectHeightFinal;
+
+    const fieldObjNum = this._ph.fieldObjNum;
+    const fieldObj = readObject(this.pdf, fieldObjNum);
+    if (!fieldObj) throw new Error('Signature field object not found for appearance');
+    const kidMatch = /\/Kids\s*\[\s*(\d+)\s+0\s+R/.exec(fieldObj.dictStr);
+    if (!kidMatch) throw new Error('Signature field has no widget to attach appearance');
+    const widgetObjNum = parseInt(kidMatch[1], 10);
+    const widgetObj = readObject(this.pdf, widgetObjNum);
+    if (!widgetObj) throw new Error('Widget annotation object missing for signature field');
+
+    const meta = readLastTrailer(this.pdf);
+    let nextObjNum = Math.max(meta.size, 0);
+    const allocateObj = () => nextObjNum++;
+
+    const imageObjNum = allocateObj();
+    let smaskObjNum = null;
+    if (pngInfo.alphaData) {
+      smaskObjNum = allocateObj();
+    }
+    const appearanceObjNum = allocateObj();
+
+    const imageStream = zlib.deflateSync(pngInfo.pixelData);
+    const imageDictParts = [
+      '/Type /XObject',
+      '/Subtype /Image',
+      '/Width ' + pngInfo.width,
+      '/Height ' + pngInfo.height,
+      '/ColorSpace /' + pngInfo.colorSpace,
+      '/BitsPerComponent 8',
+      '/Filter /FlateDecode',
+      '/Length ' + imageStream.length
+    ];
+    if (smaskObjNum) {
+      imageDictParts.push('/SMask ' + smaskObjNum + ' 0 R');
+    }
+    const imageDict = '<< ' + imageDictParts.join(' ') + ' >>';
+
+    const newObjs = [
+      { objNum: imageObjNum, dict: imageDict, stream: imageStream }
+    ];
+
+    if (smaskObjNum) {
+      const smaskStream = zlib.deflateSync(pngInfo.alphaData);
+      const smaskDict = '<< /Type /XObject /Subtype /Image /Width ' + pngInfo.width +
+        ' /Height ' + pngInfo.height + ' /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length ' + smaskStream.length + ' >>';
+      newObjs.push({ objNum: smaskObjNum, dict: smaskDict, stream: smaskStream });
+    }
+
+    const textColor = Array.isArray(opts.textColor) && opts.textColor.length === 3
+      ? opts.textColor.map((c) => (typeof c === 'number' ? Math.max(0, Math.min(1, c)) : 0))
+      : null;
+
+    let encodedTextRuns = null;
+    if (hasText) {
+      encodedTextRuns = layout.lines.map((line) => _pdfStringLiteralFromBuffer(_encodeWinAnsiString(line)));
+    }
+
+    const appearanceParts = [];
+    appearanceParts.push('q');
+    const imageTranslateY = hasText && textPosition === 'bottom' ? textBlockHeight : 0;
+    appearanceParts.push(
+      _formatPdfNumber(rectWidthFinal) + ' 0 0 ' + _formatPdfNumber(imageHeight) + ' 0 ' + _formatPdfNumber(imageTranslateY) + ' cm'
+    );
+    appearanceParts.push('/Im0 Do');
+    appearanceParts.push('Q');
+
+    if (hasText && encodedTextRuns) {
+      appearanceParts.push('q');
+      if (textColor) {
+        appearanceParts.push(
+          _formatPdfNumber(textColor[0]) + ' ' +
+          _formatPdfNumber(textColor[1]) + ' ' +
+          _formatPdfNumber(textColor[2]) + ' rg'
+        );
+      } else {
+        appearanceParts.push('0 0 0 rg');
+      }
+      appearanceParts.push('BT');
+      const textFontSize = layout.fontSize;
+      const textLineHeight = layout.lineHeight;
+      const laidOutLines = layout.lines;
+      appearanceParts.push('/F0 ' + _formatPdfNumber(textFontSize) + ' Tf');
+      const textBlockOriginY = textPosition === 'bottom' ? 0 : rectHeightFinal - textBlockHeight;
+      let baselineY = textBlockOriginY + textBlockHeight - textPadding.top - textFontSize;
+      const marginLeft = textPadding.left;
+      laidOutLines.forEach((line, idx) => {
+        appearanceParts.push('1 0 0 1 ' + _formatPdfNumber(marginLeft) + ' ' + _formatPdfNumber(baselineY) + ' Tm');
+        const encoded = encodedTextRuns[idx] || '()';
+        appearanceParts.push(encoded + ' Tj');
+        if (idx !== laidOutLines.length - 1) {
+          baselineY -= textLineHeight;
+        }
+      });
+      appearanceParts.push('ET');
+      appearanceParts.push('Q');
+    }
+
+    appearanceParts.push('');
+    const appearanceContent = Buffer.from(appearanceParts.join('\n'), 'latin1');
+    const resourcesParts = ['/XObject << /Im0 ' + imageObjNum + ' 0 R >>'];
+    if (hasText && encodedTextRuns) {
+      const encodingDifferences = '[ 208 /Gbreve 221 /Idotaccent 222 /Scedilla 240 /gbreve 253 /dotlessi 254 /scedilla ]';
+      const fontDict = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences ' + encodingDifferences + ' >> >>';
+      const fontObjNum = allocateObj();
+      newObjs.push({ objNum: fontObjNum, contentStr: fontDict });
+      resourcesParts.push('/Font << /F0 ' + fontObjNum + ' 0 R >>');
+    }
+    const appearanceDict = '<< /Type /XObject /Subtype /Form /BBox [0 0 ' +
+      _formatPdfNumber(rectWidthFinal) + ' ' + _formatPdfNumber(rectHeightFinal) + '] /Resources << ' +
+      resourcesParts.join(' ') + ' >> /Length ' + appearanceContent.length + ' >>';
+    newObjs.push({ objNum: appearanceObjNum, dict: appearanceDict, stream: appearanceContent });
+
+    let widgetDict = widgetObj.dictStr;
+    widgetDict = _setRect(widgetDict, [x, y, x2, y2]);
+    widgetDict = _setAppearance(widgetDict, appearanceObjNum + ' 0 R');
+    newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
+
+    const newSize = Math.max(nextObjNum, meta.size);
+    this.pdf = _appendXrefTrailer(this.pdf, newObjs, {
+      size: newSize,
+      rootRef: meta.rootRef,
+      prevXref: meta.startxref
+    });
+    this.size = newSize;
+    this.prevXref = meta.startxref;
+    this._refreshByteRange();
+
+    return { width: rectWidthFinal, height: rectHeightFinal, x, y };
   }
 
   injectCMS(cmsDer){
@@ -1314,6 +1808,14 @@ class PDFPAdESWriter {
     function pad(x){ return String(x).padStart(2,'0'); }
     return 'D:' + d.getUTCFullYear() + pad(d.getUTCMonth()+1) + pad(d.getUTCDate()) +
            pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + pad(d.getUTCSeconds()) + 'Z';
+  }
+  _refreshByteRange(){
+    if (!this._ph || typeof this._ph.brNumsStart !== 'number') return;
+    const beforeLen = this._ph.lessThanPos - 0;
+    const afterStart = this._ph.afterStart;
+    const afterLen = this.pdf.length - afterStart;
+    const text = this._p10(0) + ' ' + this._p10(beforeLen) + ' ' + this._p10(afterStart) + ' ' + this._p10(afterLen);
+    this.pdf = this._patchByteRange(this.pdf, this._ph.brNumsStart, text);
   }
 
   _locateNewSigSpans(buf, sigObjNum){
@@ -1357,145 +1859,6 @@ class PDFPAdESWriter {
   }
 }
 
-function applyVisibleSignatureAppearance(pdfBuffer, options){
-  if (!options || typeof options !== 'object') throw new Error('options required');
-  const { widgetObjNum, pageObjNum = null, rect, pngBuffer, appearanceName, parentObjNum = null } = options;
-  if (!Buffer.isBuffer(pngBuffer)) throw new Error('pngBuffer must be Buffer');
-  if (typeof widgetObjNum !== 'number') throw new Error('widgetObjNum must be a number');
-  pdfBuffer = _requirePdfBuffer(pdfBuffer, 'pdfBuffer');
-  const rectArr = Array.isArray(rect) && rect.length === 4 ? rect.map((v) => Number(v) || 0) : null;
-  if (!rectArr) throw new Error('rect must be an array of 4 numbers');
-  const normalizedRect = _normalizeRect(rectArr);
-
-  const png = parsePng(pngBuffer);
-  const meta = readLastTrailer(pdfBuffer);
-  let nextObj = meta.size;
-
-  const imageObjNum = nextObj++;
-  let smaskObjNum = null;
-  const newObjs = [];
-
-  const colorCompressed = zlib.deflateSync(png.pixelData);
-  const imageDictParts = [
-    '/Type /XObject',
-    '/Subtype /Image',
-    '/Width ' + png.width,
-    '/Height ' + png.height,
-    '/ColorSpace /' + png.colorSpace,
-    '/BitsPerComponent ' + png.bitDepth,
-    '/Filter /FlateDecode',
-    '/Length ' + colorCompressed.length
-  ];
-  if (png.alphaData) {
-    smaskObjNum = nextObj++;
-    imageDictParts.push('/SMask ' + smaskObjNum + ' 0 R');
-  }
-  const imageHeader = '<< ' + imageDictParts.join(' ') + ' >>\nstream\n';
-  const imageBuffer = Buffer.concat([Buffer.from(imageHeader, 'latin1'), colorCompressed, Buffer.from('\nendstream', 'latin1')]);
-  newObjs.push({ objNum: imageObjNum, contentBuffer: imageBuffer });
-
-  if (png.alphaData) {
-    const alphaCompressed = zlib.deflateSync(png.alphaData);
-    const smaskParts = [
-      '/Type /XObject',
-      '/Subtype /Image',
-      '/Width ' + png.width,
-      '/Height ' + png.height,
-      '/ColorSpace /DeviceGray',
-      '/BitsPerComponent 8',
-      '/Filter /FlateDecode',
-      '/Length ' + alphaCompressed.length
-    ];
-    const smaskHeader = '<< ' + smaskParts.join(' ') + ' >>\nstream\n';
-    const smaskBuffer = Buffer.concat([Buffer.from(smaskHeader, 'latin1'), alphaCompressed, Buffer.from('\nendstream', 'latin1')]);
-    newObjs.push({ objNum: smaskObjNum, contentBuffer: smaskBuffer });
-  }
-
-  const rectWidth = normalizedRect[2] - normalizedRect[0];
-  const rectHeight = normalizedRect[3] - normalizedRect[1];
-  const appearanceWidth = Math.abs(rectWidth);
-  const appearanceHeight = Math.abs(rectHeight);
-  if (appearanceWidth === 0 || appearanceHeight === 0) {
-    throw new Error('visible signature rect must have non-zero width and height');
-  }
-
-  const rawName = typeof appearanceName === 'string' && appearanceName.length > 0 ? appearanceName : 'ImStamp';
-  const sanitized = rawName.replace(/^\//, '').replace(/[^A-Za-z0-9]/g, '') || 'ImStamp';
-  const nameToken = '/' + sanitized;
-
-  const naturalWidth = png.width || 1;
-  const naturalHeight = png.height || 1;
-  const scaleX = appearanceWidth / naturalWidth;
-  const scaleY = appearanceHeight / naturalHeight;
-  const uniformScale = Math.min(scaleX, scaleY);
-  const drawWidth = naturalWidth * uniformScale;
-  const drawHeight = naturalHeight * uniformScale;
-  const offsetX = (appearanceWidth - drawWidth) / 2;
-  const offsetY = (appearanceHeight - drawHeight) / 2;
-
-  const appearanceBodyLines = [
-    'q',
-    _formatPdfNumber(drawWidth) + ' 0 0 ' + _formatPdfNumber(drawHeight) + ' ' +
-      _formatPdfNumber(offsetX) + ' ' + _formatPdfNumber(offsetY) + ' cm',
-    nameToken + ' Do',
-    'Q'
-  ];
-  const appearanceBody = Buffer.from(appearanceBodyLines.join('\n') + '\n', 'latin1');
-  const appearanceDictParts = [
-    '/Type /XObject',
-    '/Subtype /Form',
-    '/FormType 1',
-    '/BBox [0 0 ' + _formatPdfNumber(appearanceWidth) + ' ' + _formatPdfNumber(appearanceHeight) + ']',
-    '/Resources << /XObject << ' + nameToken + ' ' + imageObjNum + ' 0 R >> >>',
-    '/Length ' + appearanceBody.length
-  ];
-  const appearanceHeader = '<< ' + appearanceDictParts.join(' ') + ' >>\nstream\n';
-  const appearanceBuffer = Buffer.concat([Buffer.from(appearanceHeader, 'latin1'), appearanceBody, Buffer.from('\nendstream', 'latin1')]);
-  const appearanceObjNum = nextObj++;
-  newObjs.push({ objNum: appearanceObjNum, contentBuffer: appearanceBuffer });
-
-  const widgetObj = readObject(pdfBuffer, widgetObjNum);
-  if (!widgetObj || !widgetObj.dictStr) throw new Error('Widget object not found');
-  const existingParent = _extractRef(widgetObj.dictStr, '/Parent');
-  const existingPage = _extractRef(widgetObj.dictStr, '/P');
-  const extras = _extractDictEntries(widgetObj.dictStr).filter((entry) => {
-    return !['/Type', '/Subtype', '/FT', '/Rect', '/F', '/Parent', '/P', '/AP', '/AS'].includes(entry.key);
-  });
-  const normalizedWidget = _composeWidgetDict({
-    rect: normalizedRect,
-    parentObjNum: typeof parentObjNum === 'number' && parentObjNum >= 0
-      ? parentObjNum
-      : (typeof existingParent === 'number' ? existingParent : null),
-    pageObjNum: typeof pageObjNum === 'number' && pageObjNum >= 0
-      ? pageObjNum
-      : (typeof existingPage === 'number' ? existingPage : null),
-    extras
-  });
-  let widgetDict = normalizedWidget.replace(/>>\s*$/, '');
-  if (!/\/Parent\s+\d+\s+0\s+R/.test(widgetDict) && typeof existingParent === 'number' && existingParent >= 0) {
-    widgetDict += ' /Parent ' + existingParent + ' 0 R';
-  }
-  if (typeof pageObjNum === 'number' && pageObjNum >= 0 && !/\/P\s+\d+\s+0\s+R/.test(widgetDict)) {
-    widgetDict += ' /P ' + pageObjNum + ' 0 R';
-  }
-  widgetDict += ' /AP << /N ' + appearanceObjNum + ' 0 R >>';
-  widgetDict += ' /AS /N';
-  widgetDict += ' >>';
-  newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
-
-  const maxObjNum = newObjs.reduce((max, obj) => Math.max(max, obj.objNum), -Infinity);
-  const newSize = Math.max(meta.size, maxObjNum + 1);
-  const updatedPdf = _appendXrefTrailer(pdfBuffer, newObjs, { size: newSize, rootRef: meta.rootRef, prevXref: meta.startxref });
-
-  return {
-    pdf: updatedPdf,
-    appearanceObjNum,
-    imageObjNum,
-    smaskObjNum,
-    widgetObjNum
-  };
-}
-
 /* ------------------------------ AcroForm lookup ------------------------------ */
 
 function locateAcroForm(pdf, rootObjNum){
@@ -1536,193 +1899,11 @@ function findEmptySignatureField(pdf, rootObjNum, fieldName){
   return null;
 }
 
-function applyVisibleSignatureStamp({ pdfBuffer, fieldName, rect, pageIndex = null, stampBuffer }){
-  if (!Buffer.isBuffer(pdfBuffer)) throw new Error('pdfBuffer must be Buffer');
-  if (!Buffer.isBuffer(stampBuffer)) throw new Error('stampBuffer must be Buffer');
-
-  let normalizedRect;
-  if (Array.isArray(rect)) {
-    if (rect.length !== 4) throw new Error('visible signature rect must have 4 elements');
-    normalizedRect = rect.map(Number);
-  } else if (rect && typeof rect === 'object') {
-    const { x, y, width, height } = rect;
-    if (![x, y, width, height].every((v) => typeof v === 'number' && Number.isFinite(v))) {
-      throw new Error('visible signature rect object must have finite x, y, width, height');
-    }
-    normalizedRect = [x, y, x + width, y + height];
-  } else {
-    throw new Error('visible signature rect must be an array [llx,lly,urx,ury] or an object {x,y,width,height}');
-  }
-  if (normalizedRect.some((n) => !Number.isFinite(n))) throw new Error('rect values must be finite numbers');
-  const [llx, lly, urx, ury] = normalizedRect;
-  if (urx <= llx || ury <= lly) throw new Error('rect must have positive width and height');
-
-  const width = urx - llx;
-  const height = ury - lly;
-
-  const meta = readLastTrailer(pdfBuffer);
-  const targetFieldName = (typeof fieldName === 'string' && fieldName.length > 0) ? fieldName : null;
-  const field = findEmptySignatureField(pdfBuffer, meta.rootObjNum, targetFieldName);
-  if (!field) throw new Error('Signature field not found or already contains a value');
-
-  const resolveWidgetObjNum = () => {
-    const kidsMatch = /\/Kids\s*\[([^\]]+)\]/.exec(field.dictStr);
-    if (kidsMatch) {
-      const widgetMatch = /(\d+)\s+0\s+R/.exec(kidsMatch[1]);
-      if (widgetMatch) return parseInt(widgetMatch[1], 10);
-    }
-    const fieldObj = readObject(pdfBuffer, field.objNum);
-    if (fieldObj && /\/Subtype\s*\/Widget\b/.test(fieldObj.dictStr)) {
-      return field.objNum;
-    }
-    return null;
-  };
-
-  const widgetObjNum = resolveWidgetObjNum();
-  if (!widgetObjNum) throw new Error('Signature widget annotation not found');
-
-  const widgetObj = readObject(pdfBuffer, widgetObjNum);
-  if (!widgetObj || !widgetObj.dictStr) throw new Error('Signature widget object missing');
-  let widgetDict = widgetObj.dictStr;
-
-  let pageRef = null;
-  const existingPageMatch = /\/P\s+(\d+)\s+0\s+R/.exec(widgetDict);
-  if (existingPageMatch) pageRef = existingPageMatch[1] + ' 0 R';
-
-  const requestedPageIndex = (pageIndex === null || pageIndex === undefined) ? null : pageIndex;
-  if (requestedPageIndex != null) {
-    if (!Number.isInteger(requestedPageIndex) || requestedPageIndex < 0) {
-      throw new Error('pageIndex must be a non-negative integer');
-    }
-    try {
-      const pageObjNum = findPageObjNumByIndex(pdfBuffer, requestedPageIndex);
-      if (pageObjNum == null) throw new Error('Requested page index out of range for visible signature');
-      pageRef = pageObjNum + ' 0 R';
-    } catch (_err) {
-      // Sayfa dizini hatalarında en azından ilk sayfaya düş
-      try {
-        const fallbackPage = findFirstPageObjNumSafe(pdfBuffer);
-        if (fallbackPage != null) {
-          pageRef = fallbackPage + ' 0 R';
-        }
-      } catch (_err2) {
-        const scanned = _findFirstPageByScan(pdfBuffer);
-        if (scanned != null) pageRef = scanned + ' 0 R';
-      }
-      if (!pageRef) throw _err;
-    }
-  } else if (!pageRef) {
-    try {
-      const fallbackPage = findPageObjNumByIndex(pdfBuffer, 0);
-      if (fallbackPage == null) throw new Error('Unable to locate any page for visible signature');
-      pageRef = fallbackPage + ' 0 R';
-    } catch (err) {
-      const scanned = _findFirstPageByScan(pdfBuffer);
-      if (scanned != null) {
-        pageRef = scanned + ' 0 R';
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  const png = parsePng(stampBuffer);
-  const imageData = zlib.deflateSync(png.pixelData);
-  const alphaData = png.alphaData ? zlib.deflateSync(png.alphaData) : null;
-
-  const state = getPdfState(pdfBuffer);
-  const xrefKeys = Array.from(state.xrefMap.keys());
-  const maxExisting = xrefKeys.length ? Math.max(...xrefKeys) : (meta.size - 1);
-  let nextObjNum = Math.max(meta.size, maxExisting + 1);
-
-  const newObjs = [];
-  const ensurePageContainsWidget = (pageRefStr) => {
-    const pageMatch = /^(\d+)\s+0\s+R$/.exec(pageRefStr || '');
-    if (!pageMatch) return;
-    const pageObjNum = parseInt(pageMatch[1], 10);
-    const pageObj = readObject(pdfBuffer, pageObjNum);
-    if (!pageObj || !pageObj.dictStr) return;
-    const updated = _appendUniqueRef(pageObj.dictStr, '/Annots', widgetObjNum);
-    if (updated !== pageObj.dictStr) {
-      const existingUpdate = newObjs.find((o) => o.objNum === pageObjNum);
-      if (existingUpdate) {
-        existingUpdate.contentStr = updated;
-      } else {
-        newObjs.push({ objNum: pageObjNum, contentStr: updated });
-      }
-    }
-  };
-  let smaskObjNum = null;
-  if (alphaData) {
-    smaskObjNum = nextObjNum++;
-    const smaskDict = '<< /Type /XObject /Subtype /Image /Width ' + png.width + ' /Height ' + png.height + ' /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0 1] /Filter /FlateDecode /Length ' + alphaData.length + ' >>';
-    const smaskStream = smaskDict + '\nstream\n' + alphaData.toString('latin1') + '\nendstream';
-    newObjs.push({ objNum: smaskObjNum, contentStr: smaskStream });
-  }
-
-  const imageObjNum = nextObjNum++;
-  let imageDict = '<< /Type /XObject /Subtype /Image /Width ' + png.width + ' /Height ' + png.height + ' /ColorSpace /' + png.colorSpace + ' /BitsPerComponent ' + png.bitDepth + ' /Filter /FlateDecode /Length ' + imageData.length;
-  if (smaskObjNum) imageDict += ' /SMask ' + smaskObjNum + ' 0 R';
-  imageDict += ' >>';
-  const imageStream = imageDict + '\nstream\n' + imageData.toString('latin1') + '\nendstream';
-  newObjs.push({ objNum: imageObjNum, contentStr: imageStream });
-
-  const appearanceObjNum = nextObjNum++;
-  const rectWidthStr = _formatPdfNumber(width);
-  const rectHeightStr = _formatPdfNumber(height);
-  const scale = Math.min(width / png.width, height / png.height);
-  const drawnW = _formatPdfNumber(png.width * scale);
-  const drawnH = _formatPdfNumber(png.height * scale);
-  const offsetX = _formatPdfNumber((width - (png.width * scale)) / 2);
-  const offsetY = _formatPdfNumber((height - (png.height * scale)) / 2);
-  const appearanceContent = Buffer.from('q ' + drawnW + ' 0 0 ' + drawnH + ' ' + offsetX + ' ' + offsetY + ' cm /Im1 Do Q', 'latin1');
-  const appearanceDict = '<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 ' + rectWidthStr + ' ' + rectHeightStr + '] /Resources << /XObject << /Im1 ' + imageObjNum + ' 0 R >> >> /Length ' + appearanceContent.length + ' >>';
-  const appearanceStream = appearanceDict + '\nstream\n' + appearanceContent.toString('latin1') + '\nendstream';
-  newObjs.push({ objNum: appearanceObjNum, contentStr: appearanceStream });
-
-  widgetDict = _injectKeyRaw(widgetDict, '/Type /Annot');
-  widgetDict = _injectKeyRaw(widgetDict, '/Subtype /Widget');
-  widgetDict = _replaceOrAppend(widgetDict, /\/Rect\s*\[[^\]]*\]/, '/Rect [' + normalizedRect.map(_formatPdfNumber).join(' ') + ']');
-  widgetDict = _replaceOrAppend(widgetDict, /\/P\s+\d+\s+0\s+R/, '/P ' + pageRef);
-  widgetDict = _replaceOrAppend(widgetDict, /\/F\s+\d+/, '/F 4');
-  widgetDict = _replaceOrAppend(widgetDict, /\/AP\s*<<[\s\S]*?>>/, '/AP << /N ' + appearanceObjNum + ' 0 R >>');
-  if (!/\/AP\s*<<[\s\S]*?>>/.test(widgetDict)) {
-    widgetDict = widgetDict.replace(/>>\s*$/, ' /AP << /N ' + appearanceObjNum + ' 0 R >> >>');
-  }
-  widgetDict = _replaceOrAppend(widgetDict, /\/AS\s+\/?\w+/, '/AS /N');
-  if (!/\/AS\s+\/?\w+/.test(widgetDict)) {
-    widgetDict = widgetDict.replace(/>>\s*$/, ' /AS /N >>');
-  }
-  if (!/\/P\s+\d+\s+0\s+R/.test(widgetDict)) {
-    widgetDict = widgetDict.replace(/>>\s*$/, ' /P ' + pageRef + ' >>');
-  }
-  if (!/\/F\s+\d+/.test(widgetDict)) {
-    widgetDict = widgetDict.replace(/>>\s*$/, ' /F 4 >>');
-  }
-  if (!/\/Rect\s*\[/.test(widgetDict)) {
-    widgetDict = widgetDict.replace(/>>\s*$/, ' /Rect [' + normalizedRect.map(_formatPdfNumber).join(' ') + '] >>');
-  }
-
-  newObjs.push({ objNum: widgetObjNum, contentStr: widgetDict });
-  ensurePageContainsWidget(pageRef);
-
-  const highestObj = newObjs.reduce((max, o) => Math.max(max, o.objNum), maxExisting);
-  const newSize = Math.max(meta.size, highestObj + 1);
-
-  return _appendXrefTrailer(pdfBuffer, newObjs, {
-    size: newSize,
-    rootRef: meta.rootRef,
-    prevXref: meta.startxref
-  });
-}
-
 /* --------------------------------- exports --------------------------------- */
 
 module.exports = {
   PDFPAdESWriter,
   ensureAcroFormAndEmptySigField,
-  applyVisibleSignatureAppearance,
-  applyVisibleSignatureStamp,
   readLastTrailer,
   readObject
 };

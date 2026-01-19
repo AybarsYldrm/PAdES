@@ -1,33 +1,11 @@
 'use strict';
-const path = require('path');
 const crypto = require('crypto');
-const { PDFPAdESWriter, ensureAcroFormAndEmptySigField, applyVisibleSignatureStamp } = require('./pdf_parser');
-const { pemToDer, parseCertBasics, parseKeyUsageAndEKU, extractSubjectCommonName } = require('./x509_extract');
+const fs = require('fs');
+const { PDFPAdESWriter, ensureAcroFormAndEmptySigField } = require('./pdf_parser');
+const { pemToDer, parseCertBasics, parseKeyUsageAndEKU, extractSubjectCN } = require('./x509_extract');
 const { buildTSQ, requestTimestamp, extractTimeStampTokenOrThrow } = require('./rfc3161');
 const { OIDS } = require('./oids');
 const { buildCAdES_BES_auto, addUnsignedAttr_signatureTimeStampToken, buildSignedData } = require('./cades_builder');
-const { generateStamp } = require('./stamp');
-
-function normalizeFieldName(name) {
-  if (typeof name !== 'string') return null;
-  const trimmed = name.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/^\//, '');
-}
-
-function normalizeFieldName(name) {
-  if (typeof name !== 'string') return null;
-  const trimmed = name.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/^\//, '');
-}
-
-function normalizeFieldName(name) {
-  if (typeof name !== 'string') return null;
-  const trimmed = name.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/^\//, '');
-}
 
 // TSA hash adı -> OID
 const HASH_NAME_TO_OID = {
@@ -62,11 +40,6 @@ class PAdESManager {
     }
   }
 
-  #shouldAllowMissingNonce() {
-    const opt = this.tsaOptions ? this.tsaOptions.allowMissingNonce : undefined;
-    return opt === undefined ? true : opt !== false;
-  }
-
   _logDebug(message, context) {
     if (this.logger && typeof this.logger.debug === 'function') {
       this.logger.debug(message, context || {});
@@ -82,8 +55,7 @@ class PAdESManager {
     let workingPdf = pdfBuffer;
 
     if (normalizedFieldName) {
-      const ensured = ensureAcroFormAndEmptySigField(workingPdf, normalizedFieldName);
-      workingPdf = ensured.pdf;
+      workingPdf = ensureAcroFormAndEmptySigField(workingPdf, normalizedFieldName);
     }
 
     const writer = new PDFPAdESWriter(workingPdf);
@@ -101,7 +73,7 @@ class PAdESManager {
     // TSA hash seçimi
     const tsHashName = (this.tsaOptions.hashName || 'sha256').toLowerCase();
     const tsHashOid  = HASH_NAME_TO_OID[tsHashName] || OIDS.sha256;
-    const allowMissingNonce = this.#shouldAllowMissingNonce();
+    const allowMissingNonce = this.tsaOptions.allowMissingNonce;
 
     const tbsHash = writer.computeByteRangeHash(tsHashName);
     this._logDebug('DocTimeStamp.byteRangeHash', { hashAlgorithm: tsHashName, digest: tbsHash.toString('hex') });
@@ -153,39 +125,18 @@ class PAdESManager {
       addDocumentTimeStamp,
       documentTimestampProvided: !!documentTimestamp
     });
-
-    const leafDer = pemToDer(certPem);
-    const subjectCommonName = extractSubjectCommonName(leafDer);
-    const normalizedFieldName = normalizeFieldName(fieldName);
-    const targetFieldName = normalizedFieldName || 'Sig1';
-    const visibleFieldName = targetFieldName;
-    const visibleReason = (visibleSignature && typeof visibleSignature === 'object' && typeof visibleSignature.reason === 'string')
-      ? visibleSignature.reason
-      : null;
-    let resolvedStampName = null;
-
-    const visibleSigConfig = (visibleSignature && typeof visibleSignature === 'object') ? visibleSignature : null;
-    const ensureOptions = {};
-
-    if (visibleSigConfig) {
-      const rectSource = typeof visibleSigConfig.rect === 'function'
-        ? visibleSigConfig.rect(subjectCommonName)
-        : visibleSigConfig.rect;
-      if (Array.isArray(rectSource) && rectSource.length === 4) {
-        ensureOptions.rect = rectSource.map((v) => Number(v) || 0);
-      }
-      const pageIndexSource = typeof visibleSigConfig.pageIndex === 'function'
-        ? visibleSigConfig.pageIndex(subjectCommonName)
-        : visibleSigConfig.pageIndex;
-      if (typeof pageIndexSource === 'number' && pageIndexSource >= 0) {
-        ensureOptions.pageIndex = Math.floor(pageIndexSource);
-      }
-    }
-
-    const ensuredField = ensureAcroFormAndEmptySigField(pdfBuffer, targetFieldName, ensureOptions);
-    pdfBuffer = ensuredField.pdf;
+    pdfBuffer = ensureAcroFormAndEmptySigField(pdfBuffer, fieldName || 'Sig1');
 
     // KeyUsage kontrolü (auto fallback DocTS)
+    const leafDer = pemToDer(certPem);
+    const subjectCN = (() => {
+      try {
+        return extractSubjectCN(leafDer) || null;
+      } catch (err) {
+        this._logDebug('PAdES.subjectCN.error', { error: err && err.message ? err.message : String(err) });
+        return null;
+      }
+    })();
     const { keyUsage = {}, eku = [] } = this._parseKeyUsageAndEKU(leafDer);
     const keyUsageBitsPresent = Object.values(keyUsage).some(Boolean);
     const canSignByKU = !keyUsageBitsPresent || keyUsage.digitalSignature || keyUsage.contentCommitment;
@@ -194,6 +145,7 @@ class PAdESManager {
     const canSign = canSignByKU && !tsaOnly;
     this._logDebug('PAdES.keyUsage', { keyUsage, eku: ekuList, canSign, reason: canSign ? 'allowed' : 'disallowed' });
 
+    const normalizeFieldName = (name) => (typeof name === 'string' && name.length > 0 ? name : null);
     const resolvedDocTs = (() => {
       if (documentTimestamp && typeof documentTimestamp === 'object') {
         const append = !!documentTimestamp.append;
@@ -218,71 +170,6 @@ class PAdESManager {
       viaDocumentTimestampOption: !!documentTimestamp
     });
 
-    if (visibleSignature && typeof visibleSignature === 'object') {
-      const rectInput = visibleSignature.rect || visibleSignature.position;
-      if (!rectInput) {
-        throw new Error('visibleSignature.rect or visibleSignature.position must be provided');
-      }
-
-      let stampBuffer = visibleSignature.stampBuffer;
-      if (stampBuffer && !Buffer.isBuffer(stampBuffer)) {
-        throw new Error('visibleSignature.stampBuffer must be a Buffer');
-      }
-
-      const stampCfg = (visibleSignature && typeof visibleSignature.stamp === 'object') ? visibleSignature.stamp : {};
-      if (!stampBuffer) {
-        let subjectName = '';
-        try {
-          subjectName = extractSubjectCommonName(leafDer) || '';
-        } catch (err) {
-          subjectName = '';
-          this._logDebug('PAdES.visibleSignature.subjectCN.error', { message: err.message });
-        }
-        const resolvedName = (() => {
-          if (typeof visibleSignature.personName === 'function') return visibleSignature.personName(subjectCommonName);
-          if (typeof visibleSignature.personName === 'string') return visibleSignature.personName;
-          if (typeof stampCfg.personName === 'function') return stampCfg.personName(subjectCommonName);
-          if (typeof stampCfg.personName === 'string') return stampCfg.personName;
-          return subjectName;
-        })();
-        const stampInput = {
-          fontPath: stampCfg.fontPath || path.join(__dirname, 'font.ttf'),
-          pngLogoPath: stampCfg.pngLogoPath || path.join(__dirname, 'caduceus.png'),
-          personName: resolvedName
-        };
-        if (typeof stampCfg.finalW === 'number') stampInput.finalW = stampCfg.finalW;
-        if (typeof stampCfg.finalH === 'number') stampInput.finalH = stampCfg.finalH;
-        if (typeof stampCfg.leftW === 'number') stampInput.leftW = stampCfg.leftW;
-        if (typeof stampCfg.rightW === 'number') stampInput.rightW = stampCfg.rightW;
-        if (typeof stampCfg.SS === 'number') stampInput.SS = stampCfg.SS;
-        if (stampCfg.outPath) stampInput.outPath = stampCfg.outPath;
-        stampBuffer = generateStamp(stampInput);
-        resolvedStampName = stampInput.personName;
-      }
-
-      if (!resolvedStampName) {
-        if (typeof stampCfg.personName === 'string') resolvedStampName = stampCfg.personName;
-        else if (typeof stampCfg.personName === 'function') resolvedStampName = stampCfg.personName(subjectCommonName);
-        else if (typeof visibleSignature.personName === 'string') resolvedStampName = visibleSignature.personName;
-        else if (typeof visibleSignature.personName === 'function') resolvedStampName = visibleSignature.personName(subjectCommonName);
-      }
-
-      const pageIndexForAppearance = (visibleSignature.pageIndex == null) ? 0 : visibleSignature.pageIndex;
-      this._logDebug('PAdES.visibleSignature.apply', {
-        fieldName: visibleFieldName,
-        pageIndex: pageIndexForAppearance,
-        hasCustomStamp: !!visibleSignature.stampBuffer,
-        rect: rectInput
-      });
-      pdfBuffer = applyVisibleSignatureStamp({
-        pdfBuffer,
-        fieldName: visibleFieldName,
-        rect: rectInput,
-        pageIndex: pageIndexForAppearance,
-        stampBuffer
-      });
-    }
-
     if (!canSign) {
       const docTsPlaceholderLen = resolvedDocTs.append ? resolvedDocTs.placeholderHexLen : placeholderHexLen;
       const fallbackField = resolvedDocTs.append ? resolvedDocTs.fieldName : normalizeFieldName(fieldName);
@@ -301,16 +188,88 @@ class PAdESManager {
 
     // PAdES-T akışı
     const writer = new PDFPAdESWriter(pdfBuffer);
-    const placeholderFieldName = visibleFieldName || normalizedFieldName || null;
-    const signerDisplayName = resolvedStampName || subjectCommonName || null;
     writer.preparePlaceholder({
-      subFilter: 'ETSI.CAdES.detached',
+      subFilter: 'adbe.pkcs7.detached',
       placeholderHexLen,
-      fieldName: placeholderFieldName,
-      signerName: signerDisplayName || undefined,
-      reason: visibleReason || undefined
+      fieldName,
+      signerName: subjectCN || undefined
     });
-    this._logDebug('PAdES.preparePlaceholder', { fieldName: placeholderFieldName || 'Sig1', placeholderHexLen });
+    this._logDebug('PAdES.preparePlaceholder', { fieldName: fieldName || 'Sig1', placeholderHexLen });
+
+    if (visibleSignature) {
+      try {
+        const cn = subjectCN;
+        const coordMap = (visibleSignature && typeof visibleSignature === 'object' && visibleSignature.coordinateMap) || {};
+        const defaultPosition = visibleSignature.defaultPosition || null;
+        let resolved = null;
+        if (cn && coordMap && Object.prototype.hasOwnProperty.call(coordMap, cn)) {
+          resolved = coordMap[cn];
+        }
+        if (!resolved) {
+          resolved = defaultPosition;
+        }
+        if (!resolved) {
+          throw new Error('No visible signature position configured for CN ' + (cn || 'unknown'));
+        }
+        const rect = {};
+        if (typeof resolved.x === 'number') rect.x = resolved.x;
+        if (typeof resolved.y === 'number') rect.y = resolved.y;
+        if (typeof resolved.width === 'number') rect.width = resolved.width;
+        if (typeof resolved.height === 'number') rect.height = resolved.height;
+        let imageBuffer = visibleSignature.imageBuffer || null;
+        if (!imageBuffer) {
+          if (!visibleSignature.imagePath) {
+            throw new Error('visibleSignature.imagePath or imageBuffer must be provided');
+          }
+          imageBuffer = fs.readFileSync(visibleSignature.imagePath);
+        }
+        const maintainAspectRatio = visibleSignature.maintainAspectRatio !== false;
+        const resolveTextLines = () => {
+          const templ = visibleSignature.textTemplate || visibleSignature.textLines || visibleSignature.text;
+          const cnValue = cn || visibleSignature.cnFallback || null;
+          if (Array.isArray(templ)) {
+            return templ
+              .map((line) =>
+                typeof line === 'string'
+                  ? line.replace(/\{\{\s*CN\s*\}\}/g, cnValue || '').trim()
+                  : null
+              )
+              .filter((line) => line && line.length > 0);
+          }
+          if (typeof templ === 'string' && templ.length > 0) {
+            const text = templ.replace(/\{\{\s*CN\s*\}\}/g, cnValue || '').trim();
+            return text ? [text] : [];
+          }
+          if (cnValue) {
+            return ['İmzalayan: ' + cnValue];
+          }
+          return [];
+        };
+        const textLines = resolveTextLines();
+        const textOpts = {
+          textLines,
+          textFontSize: visibleSignature.textFontSize,
+          textLineHeight: visibleSignature.textLineHeight,
+          textPadding: visibleSignature.textPadding,
+          textPosition: visibleSignature.textPosition,
+          textColor: visibleSignature.textColor,
+          textMinFontSize: visibleSignature.textMinFontSize,
+          textFontStep: visibleSignature.textFontStep
+        };
+        const appearanceResult = writer.applyVisibleSignatureFromPng({
+          imageBuffer,
+          rect,
+          maintainAspectRatio,
+          ...textOpts
+        });
+        this._logDebug('PAdES.visibleSignature.applied', {
+          cn,
+          rect: appearanceResult
+        });
+      } catch (err) {
+        throw new Error('Visible signature appearance failed: ' + (err && err.message ? err.message : err));
+      }
+    }
 
     // İmzalanacak veri özeti (algoritma sertifikanın eğrisine göre)
     const { recommendedHash } = parseCertBasics(leafDer);
@@ -325,7 +284,7 @@ class PAdESManager {
     // İmza Zaman Damgası (RFC3161) — signatureValue üzerinde
     const tsHashName = (this.tsaOptions.hashName || 'sha256').toLowerCase();
     const tsHashOid  = HASH_NAME_TO_OID[tsHashName] || OIDS.sha256;
-    const allowMissingNonce = this.#shouldAllowMissingNonce();
+    const allowMissingNonce = this.tsaOptions.allowMissingNonce;
 
     const sigValHash = this._hashSignatureForTimestamp(signatureValue, tsHashName);
     this._logDebug('PAdES.signatureTimestamp.hash', {
