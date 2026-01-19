@@ -686,4 +686,6 @@ function generateStamp({
 }
 
 /* ---------- export + example run ---------- */
-module.exports = { generateStamp };
+const generateStampPNG = generateStamp;
+
+module.exports = { generateStamp, generateStampPNG };

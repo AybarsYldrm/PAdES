@@ -1,0 +1,12 @@
+{
+  "name": "pades-signer",
+  "version": "1.0.0",
+  "description": "PAdES signing utilities and demo entrypoint",
+  "main": "index.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "test": "node index.js"
+  }
+}

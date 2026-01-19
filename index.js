@@ -2,9 +2,9 @@
 const fs = require('fs');
 const path = require('path');
 const { PAdESManager } = require('./pades_manager');
-const { generateStampPNG } = require('./test');
+const { buildVisibleSignatureConfig } = require('./signature_config');
 
-
+const DEFAULT_SIGNATURE_NAME = 'Aybars';
 
 (async () => {
   const baseDir = __dirname;
@@ -13,41 +13,15 @@ const { generateStampPNG } = require('./test');
   const OUT_PADES_T = path.join(baseDir, '_certificate.pdf');
   const KEY_PATH = path.join(baseDir, 'key.pem');
   const CERT_PATH = path.join(baseDir, 'cert.pem');
-  const defaultSignatureImage = path.join(baseDir, 'signature.png');
-  const resolveSignatureImage = () => {
-    if (process.env.SIGNATURE_IMAGE) {
-      const resolved = path.resolve(process.env.SIGNATURE_IMAGE);
-      if (fs.existsSync(resolved)) {
-        return resolved;
-      }
-      console.warn('SIGNATURE_IMAGE points to a missing file:', resolved);
-    }
-    if (fs.existsSync(defaultSignatureImage)) {
-      return defaultSignatureImage;
-    }
-    return null;
-  };
-
-  const SIGNATURE_IMAGE = resolveSignatureImage();
-
-  const visibleSignatureConfig = SIGNATURE_IMAGE
-    ? {
-        imagePath: SIGNATURE_IMAGE,
-        coordinateMap: {
-          Aybars: { x: 430, y: 130, width: 80 }
-        },
-        defaultPosition: { x: 430, y: 130, width: 80 },
-        textTemplate: `İmzalayan: {{CN}}\nTarih: ${Date.now()}`, 
-        textFontSize: 9,
-        textMinFontSize: 8,
-        textFontStep: 0.5,
-        textPadding: { top: 4, bottom: 4, left: 6 },
-        textPosition: 'top'
-      }
-    : null;
+  const signerName = process.env.SIGNATURE_NAME || DEFAULT_SIGNATURE_NAME;
+  const visibleSignatureConfig = buildVisibleSignatureConfig({
+    baseDir,
+    env: process.env,
+    signerName
+  });
 
   if (!visibleSignatureConfig) {
-    console.warn('Signature appearance demo skipped (signature.png not found and SIGNATURE_IMAGE not set).');
+    console.warn('Signature appearance skipped (signature image missing).');
   }
 
   const pm = new PAdESManager({
