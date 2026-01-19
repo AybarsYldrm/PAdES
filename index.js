@@ -2,9 +2,16 @@
 const fs = require('fs');
 const path = require('path');
 const { PAdESManager } = require('./pades_manager');
-const { generateStampPNG } = require('./test');
+const { buildSignatureImageBuffer } = require('./signature_assets');
+const {
+  DEFAULT_SIGNATURE_ORIGIN,
+  DEFAULT_SIGNATURE_POSITION,
+  parseSignaturePositions
+} = require('./signature_positions');
+const { parseBoolean, formatDateTR } = require('./signature_utils');
 
-
+const DEFAULT_SIGNATURE_NAME = 'Aybars';
+const DEFAULT_TEXT_TEMPLATE = 'İmzalayan: {{CN}}\nTarih: {{DATE}}';
 
 (async () => {
   const baseDir = __dirname;
@@ -13,31 +20,44 @@ const { generateStampPNG } = require('./test');
   const OUT_PADES_T = path.join(baseDir, '_certificate.pdf');
   const KEY_PATH = path.join(baseDir, 'key.pem');
   const CERT_PATH = path.join(baseDir, 'cert.pem');
-  const defaultSignatureImage = path.join(baseDir, 'signature.png');
-  const resolveSignatureImage = () => {
-    if (process.env.SIGNATURE_IMAGE) {
-      const resolved = path.resolve(process.env.SIGNATURE_IMAGE);
-      if (fs.existsSync(resolved)) {
-        return resolved;
-      }
-      console.warn('SIGNATURE_IMAGE points to a missing file:', resolved);
-    }
-    if (fs.existsSync(defaultSignatureImage)) {
-      return defaultSignatureImage;
-    }
-    return null;
-  };
+  const signerName = process.env.SIGNATURE_NAME || DEFAULT_SIGNATURE_NAME;
+  const signatureOutputPath = process.env.SIGNATURE_IMAGE_OUTPUT
+    ? path.resolve(process.env.SIGNATURE_IMAGE_OUTPUT)
+    : null;
+  let signatureImageBuffer = null;
+  try {
+    signatureImageBuffer = buildSignatureImageBuffer({
+      baseDir,
+      outPath: signatureOutputPath,
+      signerName
+    });
+  } catch (error) {
+    console.warn('Signature image generation failed:', error.message);
+  }
 
-  const SIGNATURE_IMAGE = resolveSignatureImage();
+  const textEnabled = parseBoolean(process.env.SIGNATURE_TEXT_ENABLED, true);
+  const textTemplate = process.env.SIGNATURE_TEXT_TEMPLATE || DEFAULT_TEXT_TEMPLATE;
+  const resolvedTextTemplate = textTemplate.replace(/\{\{\s*DATE\s*\}\}/g, formatDateTR());
+  const defaultOrigin = process.env.SIGNATURE_ORIGIN || DEFAULT_SIGNATURE_ORIGIN;
+  const useCertificateCN = parseBoolean(process.env.SIGNATURE_USE_CN, true);
 
-  const visibleSignatureConfig = SIGNATURE_IMAGE
+  const signaturePositions = parseSignaturePositions(
+    process.env.SIGNATURE_POSITIONS,
+    {
+      ...DEFAULT_SIGNATURE_POSITION,
+      origin: defaultOrigin
+    }
+  );
+
+  const visibleSignatureConfig = signatureImageBuffer
     ? {
-        imagePath: SIGNATURE_IMAGE,
-        coordinateMap: {
-          Aybars: { x: 430, y: 130, width: 80 }
-        },
-        defaultPosition: { x: 430, y: 130, width: 80 },
-        textTemplate: `İmzalayan: {{CN}}\nTarih: ${Date.now()}`, 
+        imageBuffer: signatureImageBuffer,
+        coordinateMap: signaturePositions.coordinateMap,
+        defaultPosition: signaturePositions.defaultPosition,
+        textTemplate: textEnabled ? resolvedTextTemplate : undefined,
+        textLines: textEnabled ? undefined : [],
+        useCertificateCN,
+        cnFallbackEnabled: textEnabled,
         textFontSize: 9,
         textMinFontSize: 8,
         textFontStep: 0.5,
@@ -47,7 +67,7 @@ const { generateStampPNG } = require('./test');
     : null;
 
   if (!visibleSignatureConfig) {
-    console.warn('Signature appearance demo skipped (signature.png not found and SIGNATURE_IMAGE not set).');
+    console.warn('Signature appearance skipped (signature image missing).');
   }
 
   const pm = new PAdESManager({

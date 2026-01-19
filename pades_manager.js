@@ -216,6 +216,9 @@ class PAdESManager {
         if (typeof resolved.y === 'number') rect.y = resolved.y;
         if (typeof resolved.width === 'number') rect.width = resolved.width;
         if (typeof resolved.height === 'number') rect.height = resolved.height;
+        if (typeof resolved.origin === 'string' && resolved.origin.length > 0) {
+          rect.origin = resolved.origin;
+        }
         let imageBuffer = visibleSignature.imageBuffer || null;
         if (!imageBuffer) {
           if (!visibleSignature.imagePath) {
@@ -226,7 +229,9 @@ class PAdESManager {
         const maintainAspectRatio = visibleSignature.maintainAspectRatio !== false;
         const resolveTextLines = () => {
           const templ = visibleSignature.textTemplate || visibleSignature.textLines || visibleSignature.text;
-          const cnValue = cn || visibleSignature.cnFallback || null;
+          const useCertificateCN = visibleSignature.useCertificateCN !== false;
+          const cnValue = (useCertificateCN ? cn : null) || visibleSignature.cnFallback || null;
+          const allowFallback = visibleSignature.cnFallbackEnabled !== false;
           if (Array.isArray(templ)) {
             return templ
               .map((line) =>
@@ -240,7 +245,7 @@ class PAdESManager {
             const text = templ.replace(/\{\{\s*CN\s*\}\}/g, cnValue || '').trim();
             return text ? [text] : [];
           }
-          if (cnValue) {
+          if (allowFallback && cnValue) {
             return ['İmzalayan: ' + cnValue];
           }
           return [];
