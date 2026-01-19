@@ -2,16 +2,9 @@
 const fs = require('fs');
 const path = require('path');
 const { PAdESManager } = require('./pades_manager');
-const { buildSignatureImageBuffer } = require('./signature_assets');
-const {
-  DEFAULT_SIGNATURE_ORIGIN,
-  DEFAULT_SIGNATURE_POSITION,
-  parseSignaturePositions
-} = require('./signature_positions');
-const { parseBoolean, formatDateTR } = require('./signature_utils');
+const { buildVisibleSignatureConfig } = require('./signature_config');
 
 const DEFAULT_SIGNATURE_NAME = 'Aybars';
-const DEFAULT_TEXT_TEMPLATE = 'İmzalayan: {{CN}}\nTarih: {{DATE}}';
 
 (async () => {
   const baseDir = __dirname;
@@ -21,50 +14,11 @@ const DEFAULT_TEXT_TEMPLATE = 'İmzalayan: {{CN}}\nTarih: {{DATE}}';
   const KEY_PATH = path.join(baseDir, 'key.pem');
   const CERT_PATH = path.join(baseDir, 'cert.pem');
   const signerName = process.env.SIGNATURE_NAME || DEFAULT_SIGNATURE_NAME;
-  const signatureOutputPath = process.env.SIGNATURE_IMAGE_OUTPUT
-    ? path.resolve(process.env.SIGNATURE_IMAGE_OUTPUT)
-    : null;
-  let signatureImageBuffer = null;
-  try {
-    signatureImageBuffer = buildSignatureImageBuffer({
-      baseDir,
-      outPath: signatureOutputPath,
-      signerName
-    });
-  } catch (error) {
-    console.warn('Signature image generation failed:', error.message);
-  }
-
-  const textEnabled = parseBoolean(process.env.SIGNATURE_TEXT_ENABLED, true);
-  const textTemplate = process.env.SIGNATURE_TEXT_TEMPLATE || DEFAULT_TEXT_TEMPLATE;
-  const resolvedTextTemplate = textTemplate.replace(/\{\{\s*DATE\s*\}\}/g, formatDateTR());
-  const defaultOrigin = process.env.SIGNATURE_ORIGIN || DEFAULT_SIGNATURE_ORIGIN;
-  const useCertificateCN = parseBoolean(process.env.SIGNATURE_USE_CN, true);
-
-  const signaturePositions = parseSignaturePositions(
-    process.env.SIGNATURE_POSITIONS,
-    {
-      ...DEFAULT_SIGNATURE_POSITION,
-      origin: defaultOrigin
-    }
-  );
-
-  const visibleSignatureConfig = signatureImageBuffer
-    ? {
-        imageBuffer: signatureImageBuffer,
-        coordinateMap: signaturePositions.coordinateMap,
-        defaultPosition: signaturePositions.defaultPosition,
-        textTemplate: textEnabled ? resolvedTextTemplate : undefined,
-        textLines: textEnabled ? undefined : [],
-        useCertificateCN,
-        cnFallbackEnabled: textEnabled,
-        textFontSize: 9,
-        textMinFontSize: 8,
-        textFontStep: 0.5,
-        textPadding: { top: 4, bottom: 4, left: 6 },
-        textPosition: 'top'
-      }
-    : null;
+  const visibleSignatureConfig = buildVisibleSignatureConfig({
+    baseDir,
+    env: process.env,
+    signerName
+  });
 
   if (!visibleSignatureConfig) {
     console.warn('Signature appearance skipped (signature image missing).');
