@@ -274,6 +274,88 @@ function _findFirstPageByScan(pdf){
   return null;
 }
 
+function _parseBoxArray(matchStr){
+  if (!matchStr) return null;
+  const nums = matchStr
+    .trim()
+    .split(/\s+/)
+    .map((value) => parseFloat(value))
+    .filter((num) => Number.isFinite(num));
+  if (nums.length < 4) return null;
+  const [x0, y0, x1, y1] = nums;
+  return { x0, y0, width: x1 - x0, height: y1 - y0 };
+}
+
+function _readPageBox(pdf, pageObj){
+  if (!pageObj || !pageObj.dictStr) return null;
+  const cropMatch = /\/CropBox\s*\[\s*([^\]]+)\]/.exec(pageObj.dictStr);
+  if (cropMatch) {
+    return _parseBoxArray(cropMatch[1]);
+  }
+  const mediaMatch = /\/MediaBox\s*\[\s*([^\]]+)\]/.exec(pageObj.dictStr);
+  if (mediaMatch) {
+    return _parseBoxArray(mediaMatch[1]);
+  }
+  return null;
+}
+
+function _normalizeOrigin(origin){
+  if (!origin) return 'bottom-left';
+  const norm = String(origin).trim().toLowerCase();
+  switch (norm) {
+    case 'tl':
+    case 'top-left':
+      return 'top-left';
+    case 'tr':
+    case 'top-right':
+      return 'top-right';
+    case 'br':
+    case 'bottom-right':
+      return 'bottom-right';
+    case 'bl':
+    case 'bottom-left':
+    default:
+      return 'bottom-left';
+  }
+}
+
+function _resolveRectOrigin(origin, rectWidth, rectHeight, pageBox, xInput, yInput){
+  const resolvedOrigin = _normalizeOrigin(origin);
+  if (!pageBox) {
+    if (resolvedOrigin !== 'bottom-left') {
+      throw new Error('rect origin requires page box information');
+    }
+    return { x: xInput, y: yInput };
+  }
+  const baseX = pageBox.x0 || 0;
+  const baseY = pageBox.y0 || 0;
+  const pageWidth = pageBox.width;
+  const pageHeight = pageBox.height;
+  switch (resolvedOrigin) {
+    case 'top-left':
+      return {
+        x: baseX + xInput,
+        y: baseY + pageHeight - yInput - rectHeight
+      };
+    case 'top-right':
+      return {
+        x: baseX + pageWidth - xInput - rectWidth,
+        y: baseY + pageHeight - yInput - rectHeight
+      };
+    case 'bottom-right':
+      return {
+        x: baseX + pageWidth - xInput - rectWidth,
+        y: baseY + yInput
+      };
+    case 'bottom-left':
+    default:
+      return {
+        x: baseX + xInput,
+        y: baseY + yInput
+      };
+  }
+}
+
 /* -------------------- AcroForm/Sig & Widget inşa yardımcıları -------------------- */
 
 function _injectKeyRef(dictStr, key, valueRef){
@@ -1538,8 +1620,9 @@ class PDFPAdESWriter {
     const pngInfo = parsePng(opts.imageBuffer);
     const maintainAspect = opts.maintainAspectRatio !== false;
     const rectOpts = opts.rect || {};
-    const x = (typeof rectOpts.x === 'number') ? rectOpts.x : 0;
-    const y = (typeof rectOpts.y === 'number') ? rectOpts.y : 0;
+    const xInput = (typeof rectOpts.x === 'number') ? rectOpts.x : 0;
+    const yInput = (typeof rectOpts.y === 'number') ? rectOpts.y : 0;
+    const rectOrigin = rectOpts.origin || rectOpts.anchor || opts.rectOrigin || null;
     let rectWidth = (typeof rectOpts.width === 'number') ? rectOpts.width : null;
     let rectHeightInput = (typeof rectOpts.height === 'number') ? rectOpts.height : null;
     const ratio = pngInfo.width / pngInfo.height;
@@ -1651,9 +1734,6 @@ class PDFPAdESWriter {
     const rectHeightFinal = imageHeight + textBlockHeight;
     const hasText = layout.lines.length > 0 && layout.fontSize > 0;
 
-    const x2 = x + rectWidthFinal;
-    const y2 = y + rectHeightFinal;
-
     const fieldObjNum = this._ph.fieldObjNum;
     const fieldObj = readObject(this.pdf, fieldObjNum);
     if (!fieldObj) throw new Error('Signature field object not found for appearance');
@@ -1662,6 +1742,26 @@ class PDFPAdESWriter {
     const widgetObjNum = parseInt(kidMatch[1], 10);
     const widgetObj = readObject(this.pdf, widgetObjNum);
     if (!widgetObj) throw new Error('Widget annotation object missing for signature field');
+
+    let pageBox = null;
+    const pageRefMatch = /\/P\s+(\d+)\s+0\s+R/.exec(widgetObj.dictStr);
+    if (pageRefMatch) {
+      const pageObj = readObject(this.pdf, parseInt(pageRefMatch[1], 10));
+      pageBox = _readPageBox(this.pdf, pageObj);
+    }
+
+    const resolvedCoords = _resolveRectOrigin(
+      rectOrigin,
+      rectWidthFinal,
+      rectHeightFinal,
+      pageBox,
+      xInput,
+      yInput
+    );
+    const x = resolvedCoords.x;
+    const y = resolvedCoords.y;
+    const x2 = x + rectWidthFinal;
+    const y2 = y + rectHeightFinal;
 
     const meta = readLastTrailer(this.pdf);
     let nextObjNum = Math.max(meta.size, 0);

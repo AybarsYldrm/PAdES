@@ -216,6 +216,9 @@ class PAdESManager {
         if (typeof resolved.y === 'number') rect.y = resolved.y;
         if (typeof resolved.width === 'number') rect.width = resolved.width;
         if (typeof resolved.height === 'number') rect.height = resolved.height;
+        if (typeof resolved.origin === 'string' && resolved.origin.length > 0) {
+          rect.origin = resolved.origin;
+        }
         let imageBuffer = visibleSignature.imageBuffer || null;
         if (!imageBuffer) {
           if (!visibleSignature.imagePath) {
